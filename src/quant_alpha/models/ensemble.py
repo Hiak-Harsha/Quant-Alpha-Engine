@@ -297,6 +297,8 @@ def save_ensemble_artifacts(result: MultiModelEnsembleResult) -> Path:
         compress=3,
     )
     result.oof_predictions.to_parquet(out_dir / "oof_predictions.parquet", index=False)
+    for stale in ("leaderboard.parquet", "equity_curves.parquet", "drawdown_curves.parquet", "per_asset_summary.parquet"):
+        (out_dir / stale).unlink(missing_ok=True)
     if not result.shap_importance.empty:
         result.shap_importance.to_parquet(out_dir / "shap_importance.parquet", index=False)
     with open(out_dir / "metadata.json", "w", encoding="utf-8") as f:

@@ -556,7 +556,7 @@ class PaperLedger:
 def log_paper_signals(
     tickers: List[str],
     horizons: List[str],
-    universe_name: str = "stepping_stone",
+    universe_name: str = "top_talked_leaders",
     use_cache: bool = False,
     ledger: Optional[PaperLedger] = None,
 ) -> List[Dict[str, Any]]:

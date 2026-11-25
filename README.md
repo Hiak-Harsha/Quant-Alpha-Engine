@@ -23,16 +23,19 @@ A diversified, multi-horizon quantitative market analysis, backtesting, and obje
 ## Quickstart
 ```powershell
 # 1. Validate all data, macro, and news feeds
-.venv\Scripts\python.exe -m quant_alpha.cli validate-feeds --horizon swing --universe stepping_stone
+.venv\Scripts\python.exe -m quant_alpha.cli validate-feeds --horizon swing --universe top_talked_leaders
 
-# 2. Train, tune (Optuna), and walk-forward backtest
-.venv\Scripts\python.exe -m quant_alpha.cli train-backtest --horizon swing --universe stepping_stone --trials 12
+# 2. Train, tune (Optuna), and walk-forward backtest across top diversified stocks
+.venv\Scripts\python.exe -m quant_alpha.cli train-backtest --horizon swing --universe top_talked_leaders --trials 12
 
-# 3. Generate live objective prediction across all horizons (Intraday, Swing, Long-Term)
-.venv\Scripts\python.exe -m quant_alpha.cli predict --ticker SPY --all-horizons
+# 3. Actively scan and rank predictions across top & currently trending stocks
+.venv\Scripts\python.exe -m quant_alpha.cli scan --horizon swing --universe top_talked_leaders
 
-# 4. Log & evaluate real-time paper trades (zero-leakage closed-bar ledger)
-.venv\Scripts\python.exe -m quant_alpha.cli paper-log --universe stepping_stone --horizons swing,intraday --refresh
+# 4. Generate deep-dive multi-horizon prediction for a specific ticker
+.venv\Scripts\python.exe -m quant_alpha.cli predict --ticker NVDA --all-horizons
+
+# 5. Log & evaluate real-time paper trades (zero-leakage closed-bar ledger)
+.venv\Scripts\python.exe -m quant_alpha.cli paper-log --universe top_talked_leaders --horizons swing,intraday --refresh
 .venv\Scripts\python.exe -m quant_alpha.cli paper-eval
 .venv\Scripts\python.exe -m quant_alpha.cli paper-report
 

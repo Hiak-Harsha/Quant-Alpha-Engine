@@ -17,10 +17,13 @@ from quant_alpha.config import (
     UNIVERSES,
     EngineSettings,
     HorizonConfig,
+    is_asia_india_ticker,
+    is_crypto_ticker,
 )
 from quant_alpha.data.macro_feed import load_all_macro_series
 from quant_alpha.data.market_feed import fetch_ohlcv, fetch_universe_ohlcv
 from quant_alpha.data.news_feed import fetch_all_news
+from quant_alpha.data.trending_feed import discover_trending_stocks
 from quant_alpha.features.pipeline import build_asset_feature_frame, build_universe_dataset
 from quant_alpha.features.regime import REGIME_LABELS
 from quant_alpha.features.sentiment import compute_news_sentiment_summary, score_news_dataframe
@@ -97,7 +100,7 @@ def _local_shap_drivers(lgb_model: Any, X_row: pd.DataFrame, top_n: int = 8) -> 
 
 def ensure_horizon_bundle(
     horizon_name: str,
-    universe_name: str = "stepping_stone",
+    universe_name: str = "top_talked_leaders",
     tune: bool = True,
     settings: Optional[EngineSettings] = None,
     force_retrain: bool = False,
@@ -111,12 +114,13 @@ def ensure_horizon_bundle(
             pass
 
     horizon_cfg = HORIZON_CONFIGS[horizon_name]
-    tickers = UNIVERSES.get(universe_name, UNIVERSES["stepping_stone"])
+    tickers = UNIVERSES.get(universe_name, UNIVERSES["top_talked_leaders"])
     all_tickers = list(dict.fromkeys(tickers + GLOBAL_DRIVERS))
     ohlcv_map, _ = fetch_universe_ohlcv(
         all_tickers,
         period=horizon_cfg.period,
         interval=horizon_cfg.interval,
+        max_workers=10,
         settings=settings,
     )
     macro_df = load_all_macro_series(settings=settings)
@@ -135,7 +139,7 @@ def ensure_horizon_bundle(
 def predict_asset(
     ticker: str,
     horizon_name: str = "swing",
-    universe_name: str = "stepping_stone",
+    universe_name: str = "top_talked_leaders",
     settings: Optional[EngineSettings] = None,
     ohlcv_map: Optional[Dict[str, pd.DataFrame]] = None,
     macro_df: Optional[pd.DataFrame] = None,
@@ -143,6 +147,7 @@ def predict_asset(
     bundle: Optional[Dict[str, Any]] = None,
     use_cache: bool = True,
     closed_bars_only: bool = False,
+    compute_shap: bool = True,
 ) -> LivePredictionReport:
     """Generate an objective multi-model, volatility-, regime-, and news-aware forecast."""
     settings = settings or EngineSettings()
@@ -179,18 +184,27 @@ def predict_asset(
     if target_df is None or len(target_df) < 70:
         raise ValueError(f"Insufficient price history for '{ticker}' on {horizon_name} ({horizon_cfg.interval}).")
 
+    # Live inference only needs a causal lookback window (max 252-bar stats + GARCH warm-up)
+    if len(target_df) > 360:
+        target_df = target_df.tail(360)
+    inference_ohlcv_map = {
+        k: (v.tail(450) if len(v) > 450 else v)
+        for k, v in ohlcv_map.items()
+    }
+    inference_ohlcv_map[ticker] = target_df
+
     if macro_df is None:
         macro_df = load_all_macro_series(use_cache=use_cache, settings=settings)
 
     if scored_news is None:
-        raw_news = fetch_all_news([ticker] + UNIVERSES.get(universe_name, []), use_cache=use_cache, settings=settings)
+        raw_news = fetch_all_news([ticker] + UNIVERSES.get(universe_name, [])[:30], use_cache=use_cache, settings=settings)
         scored_news = score_news_dataframe(raw_news)
 
     # Build full causal feature frame for target ticker
     asset_frame = build_asset_feature_frame(
         ticker=ticker,
         ohlcv_df=target_df,
-        ohlcv_map=ohlcv_map,
+        ohlcv_map=inference_ohlcv_map,
         macro_df=macro_df,
         horizon_cfg=horizon_cfg,
     )
@@ -313,7 +327,7 @@ def predict_asset(
 
     # Local SHAP drivers for transparency
     lgb_reg = final_models["lightgbm"][0] if "lightgbm" in final_models else None
-    top_drivers = _local_shap_drivers(lgb_reg, X_live, top_n=8)
+    top_drivers = _local_shap_drivers(lgb_reg, X_live, top_n=8) if compute_shap else []
 
     # Cross-asset correlation & macro snapshot
     cross_snap: Dict[str, Optional[float]] = {}
@@ -397,13 +411,13 @@ def predict_asset(
 
 def predict_multi_horizon_matrix(
     ticker: str,
-    universe_name: str = "stepping_stone",
+    universe_name: str = "top_talked_leaders",
     settings: Optional[EngineSettings] = None,
 ) -> List[LivePredictionReport]:
     """Generate side-by-side Intraday, Swing, and Long-Term objective predictions."""
     settings = settings or EngineSettings()
     macro_df = load_all_macro_series(settings=settings)
-    raw_news = fetch_all_news([ticker] + UNIVERSES.get(universe_name, []), settings=settings)
+    raw_news = fetch_all_news([ticker] + UNIVERSES.get(universe_name, [])[:25], settings=settings)
     scored_news = score_news_dataframe(raw_news)
 
     reports: List[LivePredictionReport] = []
@@ -419,3 +433,152 @@ def predict_multi_horizon_matrix(
             )
         )
     return reports
+
+
+@dataclass
+class MarketScanOutput:
+    """Ranked multi-stock prediction scan combining core universe and live trending tickers."""
+
+    scan_df: pd.DataFrame
+    trending_df: pd.DataFrame
+    reports: Dict[str, LivePredictionReport]
+    skipped_tickers: Dict[str, str]
+
+
+def _classify_market_bucket(ticker: str) -> str:
+    if is_crypto_ticker(ticker):
+        return "Crypto"
+    if is_asia_india_ticker(ticker) or ticker.upper() == "INDA":
+        return "India / NSE"
+    if ticker.upper() in {"SPY", "QQQ", "IWM", "TLT", "GLD", "SLV", "USO", "XLK", "XLF", "XLE", "XLV", "XLI", "XLP", "XLY", "XLU"}:
+        return "ETF / Macro"
+    return "US Stock"
+
+
+def scan_market_predictions(
+    horizon_name: str = "swing",
+    universe_name: str = "top_talked_leaders",
+    include_trending: bool = True,
+    max_trending_extras: int = 15,
+    use_cache: bool = True,
+    closed_bars_only: bool = False,
+    settings: Optional[EngineSettings] = None,
+    ohlcv_map: Optional[Dict[str, pd.DataFrame]] = None,
+    macro_df: Optional[pd.DataFrame] = None,
+    scored_news: Optional[pd.DataFrame] = None,
+    bundle: Optional[Dict[str, Any]] = None,
+) -> MarketScanOutput:
+    """Actively scan and rank predictions across top diversified & currently talked-about stocks."""
+    settings = settings or EngineSettings()
+    horizon_cfg = HORIZON_CONFIGS[horizon_name]
+    bundle = bundle or ensure_horizon_bundle(horizon_name, universe_name=universe_name, settings=settings)
+
+    base_tickers = list(UNIVERSES.get(universe_name, UNIVERSES["top_talked_leaders"]))
+    if macro_df is None:
+        macro_df = load_all_macro_series(use_cache=use_cache, settings=settings)
+
+    if scored_news is None:
+        news_tickers = list(dict.fromkeys(base_tickers[:30]))
+        scored_news = score_news_dataframe(fetch_all_news(news_tickers, use_cache=use_cache, settings=settings))
+
+    trending_df = discover_trending_stocks(
+        news_df=scored_news,
+        candidate_tickers=base_tickers,
+        use_cache=use_cache,
+        settings=settings,
+    )
+
+    scan_tickers = list(base_tickers)
+    if include_trending and not trending_df.empty:
+        extras = [s for s in trending_df["symbol"].tolist() if s not in scan_tickers][:max_trending_extras]
+        scan_tickers.extend(extras)
+
+    if ohlcv_map is None:
+        all_fetch = list(dict.fromkeys(scan_tickers + GLOBAL_DRIVERS))
+        ohlcv_map, _ = fetch_universe_ohlcv(
+            all_fetch,
+            period=horizon_cfg.period,
+            interval=horizon_cfg.interval,
+            use_cache=use_cache,
+            max_workers=10,
+            settings=settings,
+        )
+    else:
+        missing = [t for t in scan_tickers if t not in ohlcv_map]
+        if missing:
+            extra_map, _ = fetch_universe_ohlcv(
+                missing,
+                period=horizon_cfg.period,
+                interval=horizon_cfg.interval,
+                use_cache=use_cache,
+                max_workers=8,
+                settings=settings,
+            )
+            ohlcv_map.update(extra_map)
+
+    buzz_lookup = (
+        trending_df.set_index("symbol").to_dict(orient="index")
+        if not trending_df.empty
+        else {}
+    )
+
+    rows: List[Dict[str, Any]] = []
+    reports: Dict[str, LivePredictionReport] = {}
+    skipped: Dict[str, str] = {}
+
+    for t in scan_tickers:
+        try:
+            rep = predict_asset(
+                ticker=t,
+                horizon_name=horizon_name,
+                universe_name=universe_name,
+                settings=settings,
+                ohlcv_map=ohlcv_map,
+                macro_df=macro_df,
+                scored_news=scored_news,
+                bundle=bundle,
+                use_cache=use_cache,
+                closed_bars_only=closed_bars_only,
+                compute_shap=False,
+            )
+            reports[t] = rep
+            binfo = buzz_lookup.get(t, {})
+            is_actionable = 1 if rep.verdict != "NEUTRAL / HOLD" else 0
+            conviction_rank = abs(rep.composite_expected_ret_pct) * (rep.model_agreement_pct / 100.0)
+            rows.append(
+                {
+                    "ticker": t,
+                    "market": _classify_market_bucket(t),
+                    "buzz_score": float(binfo.get("buzz_score", 0.0)),
+                    "news_mentions": int(binfo.get("news_mentions", 0)),
+                    "trending_tags": str(binfo.get("sources", "")),
+                    "close": rep.last_close,
+                    "verdict": rep.verdict,
+                    "composite_ret_pct": rep.composite_expected_ret_pct,
+                    "quant_ret_pct": rep.quant_expected_ret_pct,
+                    "prob_up_pct": rep.prob_up_pct,
+                    "consensus_pct": rep.model_agreement_pct,
+                    "garch_vol_pct": rep.garch_ann_vol_pct,
+                    "regime": rep.regime_label,
+                    "news_sent": float((rep.news_summary or {}).get("composite_sentiment", 0.0)),
+                    "alloc_pct": rep.suggested_allocation_pct,
+                    "stop_loss": rep.stop_loss_price,
+                    "take_profit": rep.take_profit_price,
+                    "in_universe": rep.in_training_universe,
+                    "_sort_act": is_actionable,
+                    "_sort_conv": round(conviction_rank, 4),
+                }
+            )
+        except Exception as exc:
+            skipped[t] = str(exc)
+
+    if not rows:
+        return MarketScanOutput(pd.DataFrame(), trending_df, reports, skipped)
+
+    scan_df = (
+        pd.DataFrame(rows)
+        .sort_values(["_sort_act", "_sort_conv", "buzz_score"], ascending=False)
+        .drop(columns=["_sort_act", "_sort_conv"])
+        .reset_index(drop=True)
+    )
+    return MarketScanOutput(scan_df, trending_df, reports, skipped)

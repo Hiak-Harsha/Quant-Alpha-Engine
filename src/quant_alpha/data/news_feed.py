@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
@@ -47,49 +48,55 @@ def _parse_datetime(raw_value: Any) -> pd.Timestamp:
         return pd.Timestamp.now(tz="UTC").tz_localize(None)
 
 
-def fetch_yfinance_news(tickers: Iterable[str], limit_per_ticker: int = 12) -> List[Dict[str, Any]]:
-    """Fetch recent ticker-linked news items from Yahoo Finance."""
+def _fetch_single_yf_news(ticker: str, limit_per_ticker: int) -> List[Dict[str, Any]]:
     records: List[Dict[str, Any]] = []
-    for ticker in tickers:
-        try:
-            items = yf.Ticker(ticker).news or []
-            for item in items[:limit_per_ticker]:
-                content = item.get("content", {}) if isinstance(item, dict) else {}
-                title = (
-                    item.get("title")
-                    or content.get("title")
-                    or ""
+    try:
+        items = yf.Ticker(ticker).news or []
+        for item in items[:limit_per_ticker]:
+            content = item.get("content", {}) if isinstance(item, dict) else {}
+            title = item.get("title") or content.get("title") or ""
+            summary = content.get("summary") or item.get("summary") or ""
+            link = item.get("link") or (content.get("canonicalUrl") or {}).get("url") or ""
+            publisher = (
+                item.get("publisher")
+                or (content.get("provider") or {}).get("displayName")
+                or "yfinance"
+            )
+            pub_time = (
+                item.get("providerPublishTime")
+                or content.get("pubDate")
+                or content.get("displayTime")
+            )
+            if title:
+                records.append(
+                    {
+                        "published_at": _parse_datetime(pub_time),
+                        "title": str(title).strip(),
+                        "summary": str(summary).strip(),
+                        "source": f"yf:{publisher}",
+                        "feed": "yfinance_news",
+                        "ticker": ticker,
+                        "url": str(link).strip(),
+                    }
                 )
-                summary = content.get("summary") or item.get("summary") or ""
-                link = (
-                    item.get("link")
-                    or (content.get("canonicalUrl") or {}).get("url")
-                    or ""
-                )
-                publisher = (
-                    item.get("publisher")
-                    or (content.get("provider") or {}).get("displayName")
-                    or "yfinance"
-                )
-                pub_time = (
-                    item.get("providerPublishTime")
-                    or content.get("pubDate")
-                    or content.get("displayTime")
-                )
-                if title:
-                    records.append(
-                        {
-                            "published_at": _parse_datetime(pub_time),
-                            "title": str(title).strip(),
-                            "summary": str(summary).strip(),
-                            "source": f"yf:{publisher}",
-                            "feed": "yfinance_news",
-                            "ticker": ticker,
-                            "url": str(link).strip(),
-                        }
-                    )
-        except Exception as exc:
-            logger.debug("yfinance news error for %s: %s", ticker, exc)
+    except Exception as exc:
+        logger.debug("yfinance news error for %s: %s", ticker, exc)
+    return records
+
+
+def fetch_yfinance_news(tickers: Iterable[str], limit_per_ticker: int = 8) -> List[Dict[str, Any]]:
+    """Fetch recent ticker-linked news items concurrently from Yahoo Finance."""
+    unique = list(dict.fromkeys([t.strip() for t in tickers if t and t.strip()]))
+    if not unique:
+        return []
+    records: List[Dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=min(8, len(unique))) as pool:
+        futs = [pool.submit(_fetch_single_yf_news, t, limit_per_ticker) for t in unique]
+        for fut in as_completed(futs):
+            try:
+                records.extend(fut.result())
+            except Exception:
+                pass
     return records
 
 

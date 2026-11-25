@@ -88,6 +88,17 @@ HORIZON_CONFIGS: Dict[str, HorizonConfig] = {
 
 # Diversified multi-asset universes
 UNIVERSES: Dict[str, List[str]] = {
+    "top_talked_leaders": [
+        # US Mega-Cap Tech, AI & High-Attention Stocks
+        "NVDA", "AAPL", "MSFT", "AMZN", "GOOGL", "META", "TSLA",
+        "AMD", "AVGO", "PLTR", "NFLX", "ORCL", "MU", "INTC", "CRM",
+        # US Financials, Healthcare, Energy, Industrials & Consumer
+        "JPM", "GS", "V", "LLY", "UNH", "XOM", "CVX", "COST", "WMT", "BA",
+        # Broad Indices, Bonds, Commodities & Crypto
+        "SPY", "QQQ", "IWM", "TLT", "GLD", "SLV", "USO", "BTC-USD", "ETH-USD",
+        # India / NSE Leaders & Proxies
+        "^NSEI", "^NSEBANK", "INDA", "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "INFY.NS", "ICICIBANK.NS", "BHARTIARTL.NS",
+    ],
     "stepping_stone": [
         "SPY",       # US Large Cap (S&P 500)
         "QQQ",       # US Tech / Growth (NASDAQ-100)
@@ -99,19 +110,22 @@ UNIVERSES: Dict[str, List[str]] = {
         "BTC-USD",   # Bitcoin
     ],
     "us_equities": [
-        "SPY", "QQQ", "IWM", "AAPL", "MSFT", "NVDA", "AMZN", "JPM", "XOM", "UNH",
+        "SPY", "QQQ", "IWM", "NVDA", "AAPL", "MSFT", "AMZN", "GOOGL", "META", "TSLA",
+        "AMD", "AVGO", "PLTR", "JPM", "LLY", "XOM", "UNH",
     ],
     "us_sectors": [
         "XLK", "XLF", "XLE", "XLV", "XLI", "XLP", "XLY", "XLU",
     ],
     "india_equities": [
-        "^NSEI", "^NSEBANK", "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "INFY.NS", "ICICIBANK.NS",
+        "^NSEI", "^NSEBANK", "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "INFY.NS",
+        "ICICIBANK.NS", "BHARTIARTL.NS", "SBIN.NS", "LT.NS",
     ],
     "diversified_all": [
-        "SPY", "QQQ", "IWM", "AAPL", "MSFT", "NVDA", "JPM", "XOM",
+        "SPY", "QQQ", "IWM", "NVDA", "AAPL", "MSFT", "AMZN", "GOOGL", "META", "TSLA",
+        "AMD", "AVGO", "PLTR", "JPM", "XOM", "LLY",
         "XLK", "XLF", "XLE", "XLV",
         "TLT", "GLD", "SLV", "USO",
-        "INDA", "^NSEI", "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS",
+        "INDA", "^NSEI", "^NSEBANK", "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "INFY.NS", "ICICIBANK.NS",
         "BTC-USD", "ETH-USD",
     ],
 }

@@ -146,6 +146,8 @@ def build_model_pair(
             "max_depth": int(p.get("max_depth", 7)),
             "min_samples_leaf": int(p.get("min_samples_leaf", 30)),
             "max_features": float(p.get("max_features", 0.5)),
+            "bootstrap": True,
+            "max_samples": 0.6,
             "random_state": random_state,
             "n_jobs": -1,
         }
@@ -160,6 +162,7 @@ def build_model_pair(
             MLPRegressor(
                 hidden_layer_sizes=hidden,
                 alpha=alpha,
+                batch_size=512,
                 learning_rate_init=0.001,
                 max_iter=100,
                 early_stopping=True,
@@ -171,6 +174,7 @@ def build_model_pair(
             MLPClassifier(
                 hidden_layer_sizes=hidden,
                 alpha=alpha,
+                batch_size=512,
                 learning_rate_init=0.001,
                 max_iter=100,
                 early_stopping=True,

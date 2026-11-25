@@ -286,3 +286,16 @@ def test_paper_ledger_short_take_profit_and_flat(tmp_path) -> None:
     assert summary["hit_rate_pct"] == 100.0
     assert summary["tp_count"] == 1
     assert not ledger.get_model_accuracy_leaderboard().empty
+
+
+def test_trending_symbol_filter_and_universes() -> None:
+    from quant_alpha.config import UNIVERSES
+    from quant_alpha.data.trending_feed import _is_tradable_symbol
+
+    assert len(UNIVERSES["top_talked_leaders"]) >= 40
+    assert _is_tradable_symbol("NVDA") is True
+    assert _is_tradable_symbol("RELIANCE.NS") is True
+    assert _is_tradable_symbol("^NSEI") is True
+    assert _is_tradable_symbol("BTC-USD") is True
+    assert _is_tradable_symbol("ES=F") is False
+    assert _is_tradable_symbol("^GSPC") is False

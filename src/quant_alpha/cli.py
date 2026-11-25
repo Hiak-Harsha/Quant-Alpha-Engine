@@ -27,7 +27,11 @@ from quant_alpha.features.pipeline import build_universe_dataset
 from quant_alpha.features.sentiment import score_news_dataframe
 from quant_alpha.models.ensemble import load_ensemble_artifacts, train_and_evaluate_walkforward
 from quant_alpha.paper.ledger import PaperLedger, log_paper_signals
-from quant_alpha.predictor import predict_asset, predict_multi_horizon_matrix
+from quant_alpha.predictor import (
+    predict_asset,
+    predict_multi_horizon_matrix,
+    scan_market_predictions,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("quant_alpha")
@@ -214,30 +218,60 @@ def cmd_paper_report() -> int:
     return 0
 
 
+def cmd_scan(horizon: str, universe: str, include_trending: bool, max_trending: int, refresh: bool) -> int:
+    ensure_directories()
+    out = scan_market_predictions(
+        horizon_name=horizon,
+        universe_name=universe,
+        include_trending=include_trending,
+        max_trending_extras=max_trending,
+        use_cache=not refresh,
+    )
+    print(f"\n=== ACTIVE TOP & TRENDING STOCK PREDICTIONS ({horizon.upper()} | {len(out.scan_df)} ASSETS) ===")
+    if not out.scan_df.empty:
+        cols = [
+            "ticker", "market", "buzz_score", "news_mentions", "close",
+            "verdict", "composite_ret_pct", "prob_up_pct", "consensus_pct",
+            "garch_vol_pct", "alloc_pct", "stop_loss", "take_profit",
+        ]
+        print(out.scan_df[cols].to_string(index=False))
+        out.scan_df.to_csv(REPORTS_DIR / f"market_scan_{horizon}.csv", index=False)
+    if out.skipped_tickers:
+        print(f"\nSkipped ({len(out.skipped_tickers)} tickers lacking history):", out.skipped_tickers)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Quant Alpha Engine CLI")
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_val = sub.add_parser("validate-feeds", help="Fetch and validate all OHLCV, macro, and news feeds.")
     p_val.add_argument("--horizon", choices=list(HORIZON_CONFIGS.keys()), default="swing")
-    p_val.add_argument("--universe", choices=list(UNIVERSES.keys()), default="stepping_stone")
+    p_val.add_argument("--universe", choices=list(UNIVERSES.keys()), default="top_talked_leaders")
     p_val.add_argument("--refresh", action="store_true")
 
     p_tr = sub.add_parser("train-backtest", help="Run purged walk-forward training, Optuna tuning, and backtest.")
     p_tr.add_argument("--horizon", choices=list(HORIZON_CONFIGS.keys()), default="swing")
-    p_tr.add_argument("--universe", choices=list(UNIVERSES.keys()), default="stepping_stone")
+    p_tr.add_argument("--universe", choices=list(UNIVERSES.keys()), default="top_talked_leaders")
     p_tr.add_argument("--no-tune", action="store_true")
     p_tr.add_argument("--trials", type=int, default=12)
     p_tr.add_argument("--refresh", action="store_true")
 
     p_pr = sub.add_parser("predict", help="Generate multi-model objective prediction for a ticker.")
-    p_pr.add_argument("--ticker", type=str, default="SPY")
+    p_pr.add_argument("--ticker", type=str, default="NVDA")
     p_pr.add_argument("--horizon", choices=list(HORIZON_CONFIGS.keys()), default="swing")
-    p_pr.add_argument("--universe", choices=list(UNIVERSES.keys()), default="stepping_stone")
+    p_pr.add_argument("--universe", choices=list(UNIVERSES.keys()), default="top_talked_leaders")
     p_pr.add_argument("--all-horizons", action="store_true")
 
+    p_sc = sub.add_parser("scan", help="Scan & rank active predictions across top & trending stocks.")
+    p_sc.add_argument("--horizon", choices=list(HORIZON_CONFIGS.keys()), default="swing")
+    p_sc.add_argument("--universe", choices=list(UNIVERSES.keys()), default="top_talked_leaders")
+    p_sc.add_argument("--no-trending", action="store_true")
+    p_sc.add_argument("--max-trending", type=int, default=15)
+    p_sc.add_argument("--refresh", action="store_true")
+
     p_plog = sub.add_parser("paper-log", help="Log live closed-bar predictions into the forward paper ledger.")
-    p_plog.add_argument("--universe", choices=list(UNIVERSES.keys()), default="stepping_stone")
+    p_plog.add_argument("--universe", choices=list(UNIVERSES.keys()), default="top_talked_leaders")
     p_plog.add_argument("--horizons", type=str, default="swing,intraday")
     p_plog.add_argument("--ticker", type=str, default=None)
     p_plog.add_argument("--refresh", action="store_true")
@@ -257,6 +291,8 @@ def main(argv: List[str] | None = None) -> int:
         return cmd_train_backtest(args.horizon, args.universe, not args.no_tune, args.trials, args.refresh)
     if args.command == "predict":
         return cmd_predict(args.ticker, args.horizon, args.universe, args.all_horizons)
+    if args.command == "scan":
+        return cmd_scan(args.horizon, args.universe, not args.no_trending, args.max_trending, args.refresh)
     if args.command == "paper-log":
         return cmd_paper_log(args.universe, args.horizons, args.ticker, args.refresh)
     if args.command == "paper-eval":
