@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import json
-import logging
 import sys
 import time
 from typing import List
@@ -18,6 +16,7 @@ from quant_alpha.config import (
     REPORTS_DIR,
     UNIVERSES,
     EngineSettings,
+    configure_logging,
     ensure_directories,
 )
 from quant_alpha.data.macro_feed import load_all_macro_series
@@ -25,8 +24,7 @@ from quant_alpha.data.market_feed import fetch_universe_ohlcv
 from quant_alpha.data.news_feed import fetch_all_news
 from quant_alpha.data.validator import run_full_feed_audit
 from quant_alpha.features.pipeline import build_universe_dataset
-from quant_alpha.features.sentiment import score_news_dataframe
-from quant_alpha.models.ensemble import load_ensemble_artifacts, train_and_evaluate_walkforward
+from quant_alpha.models.ensemble import train_and_evaluate_walkforward
 from quant_alpha.paper.ledger import PaperLedger, log_paper_signals
 from quant_alpha.predictor import (
     predict_asset,
@@ -34,8 +32,7 @@ from quant_alpha.predictor import (
     scan_market_predictions,
 )
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger("quant_alpha")
+logger = configure_logging()
 
 
 def cmd_validate_feeds(horizon: str, universe: str, refresh: bool) -> int:
@@ -95,9 +92,9 @@ def cmd_train_backtest(
 
     print(f"\n=== WALK-FORWARD BACKTEST LEADERBOARD ({hcfg.display_name}) ===")
     cols = [
-        "strategy", "spearman_ic", "hit_rate_pct", "roc_auc",
-        "total_return_pct", "cagr_pct", "sharpe", "sortino",
-        "max_drawdown_pct", "p_value", "edge_verdict",
+        "strategy", "spearman_ic", "hit_rate_pct", "always_long_hit_pct", "hit_edge_pct",
+        "total_return_pct", "ann_vol_pct", "sharpe", "alpha_ann_pct", "beta_to_bh",
+        "hac_t_stat", "dsr_prob", "max_drawdown_pct", "edge_verdict",
     ]
     print(bt.leaderboard[cols].to_string(index=False))
 
@@ -129,7 +126,7 @@ def cmd_predict(ticker: str, horizon: str, universe: str, all_horizons: bool) ->
         print(f"OBJECTIVE PREDICTION: {r.ticker} | {r.horizon_display} | As of {r.as_of_timestamp}")
         print("=" * 72)
         print(f"Last Close        : {r.last_close}")
-        print(f"Verdict           : {r.verdict}")
+        print(f"Verdict           : {r.verdict} (Raw Signal: {r.raw_verdict} | Gate: {r.gate_reason})")
         print(f"Quant Expected Ret: {r.quant_expected_ret_pct:+.2f}%  | News+Quant Composite: {r.composite_expected_ret_pct:+.2f}%")
         print(f"1-Sigma Range     : [{r.expected_range_low_pct:+.2f}%, {r.expected_range_high_pct:+.2f}%]  (Cost Hurdle: {r.cost_hurdle_pct:.2f}%)")
         print(f"Upside Probability: {r.prob_up_pct:.1f}%  | Model Consensus: {r.model_agreement_pct:.1f}% (Dispersion: {r.model_disagreement_std:.3f})")
@@ -150,9 +147,9 @@ def cmd_predict(ticker: str, horizon: str, universe: str, all_horizons: bool) ->
             tr = r.backtest_track_record
             print(
                 f"\nOOS Backtest Track Record ({r.horizon_name}): "
-                f"Sharpe={tr.get('sharpe')}, IC={tr.get('spearman_ic')}, "
-                f"AUC={tr.get('roc_auc')}, MaxDD={tr.get('max_drawdown_pct')}%, "
-                f"p={tr.get('p_value')} ({tr.get('edge_verdict')})"
+                f"Sharpe={tr.get('sharpe')}, Alpha={tr.get('alpha_ann_pct')}%, "
+                f"HAC_t={tr.get('hac_t_stat')}, DSR={tr.get('dsr_prob')}, "
+                f"MaxDD={tr.get('max_drawdown_pct')}% ({tr.get('edge_verdict')})"
             )
     return 0
 
@@ -241,11 +238,14 @@ def cmd_scan(horizon: str, universe: str, include_trending: bool, max_trending: 
 
         cols = [
             "ticker", "market", "buzz_score", "news_mentions", "close", "chg_1_pct",
-            "verdict", "composite_ret_pct", "prob_up_pct", "consensus_pct",
+            "verdict", "raw_verdict", "composite_ret_pct", "prob_up_pct", "consensus_pct",
             "garch_vol_pct", "alloc_pct", "stop_loss", "take_profit",
         ]
         print("\n--- FULL UNIVERSE RANKED SIGNALS ---")
         print(out.scan_df[cols].to_string(index=False))
+        gross_alloc = float(out.scan_df["alloc_pct"].abs().sum())
+        net_alloc = float(out.scan_df["alloc_pct"].sum())
+        print(f"\nPortfolio Totals -> Gross Alloc: {gross_alloc:.1f}% | Net Alloc: {net_alloc:+.1f}%")
         out.scan_df.to_csv(REPORTS_DIR / f"market_scan_{horizon}.csv", index=False)
     if out.skipped_tickers:
         print(f"\nSkipped ({len(out.skipped_tickers)} tickers lacking history):", out.skipped_tickers)
@@ -291,7 +291,7 @@ def cmd_monitor(
                     metals[["ticker", "close", "chg_1_pct", "verdict", "composite_ret_pct", "consensus_pct", "alloc_pct", "stop_loss", "take_profit"]]
                     .to_string(index=False)
                 )
-            top_act = out.scan_df[out.scan_df["verdict"] != "NEUTRAL / HOLD"].head(15)
+            top_act = out.scan_df[~out.scan_df["verdict"].isin({"NEUTRAL / HOLD", "NO EDGE / GATED"})].head(15)
             if not top_act.empty:
                 print("\n[Top Actionable Signals]")
                 print(

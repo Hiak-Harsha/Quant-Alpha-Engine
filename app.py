@@ -5,10 +5,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 import plotly.express as px
-import plotly.graph_objects as go
 import streamlit as st
 
 SRC_DIR = Path(__file__).resolve().parent / "src"
@@ -21,6 +19,7 @@ from quant_alpha.config import (
     HORIZON_CONFIGS,
     UNIVERSES,
     EngineSettings,
+    configure_logging,
     ensure_directories,
 )
 from quant_alpha.data.macro_feed import load_all_macro_series
@@ -116,12 +115,18 @@ def _cached_backtest(horizon_name: str, _oof_df: pd.DataFrame, model_names: tupl
     dd_p = hdir / "drawdown_curves.parquet"
     as_p = hdir / "per_asset_summary.parquet"
     if lb_p.exists() and eq_p.exists() and dd_p.exists() and as_p.exists():
-        return (
-            pd.read_parquet(lb_p),
-            pd.read_parquet(eq_p),
-            pd.read_parquet(dd_p),
-            pd.read_parquet(as_p),
-        )
+        lb_cached = pd.read_parquet(lb_p)
+        as_cached = pd.read_parquet(as_p)
+        if (
+            {"alpha_ann_pct", "hac_t_stat", "dsr_prob", "gate_passed"}.issubset(lb_cached.columns)
+            and {"hit_edge_pct", "gate_passed"}.issubset(as_cached.columns)
+        ):
+            return (
+                lb_cached,
+                pd.read_parquet(eq_p),
+                pd.read_parquet(dd_p),
+                as_cached,
+            )
 
     hcfg = HORIZON_CONFIGS[horizon_name]
     bt = run_backtest_comparison(_oof_df, list(model_names), hcfg, EngineSettings(bootstrap_samples=150))
@@ -147,6 +152,7 @@ def _nse_market_status_str() -> str:
 
 
 def main() -> None:
+    configure_logging()
     ensure_directories()
     st.title("Quant Alpha Engine — India Market, Gold/Silver ETFs & Live Monitor")
     st.caption(
@@ -181,7 +187,7 @@ def main() -> None:
         ticker = custom_ticker or selected_ticker
 
         run_all_horizons = st.checkbox("Compute All-Horizons Consensus (Intraday + Swing + Long-Term)", value=False)
-        tune_trials = st.slider("Optuna Tuning Trials (when retraining)", min_value=5, max_value=30, value=10)
+        tune_trials = st.slider("Optuna Tuning Trials (when retraining)", min_value=5, max_value=30, value=12)
         retrain_clicked = st.button("Train / Retune Active Horizon", type="primary")
 
     if auto_refresh:
@@ -282,14 +288,15 @@ def main() -> None:
             bull_n = int(scan_df["verdict"].str.contains("BULLISH").sum())
             bear_n = int(scan_df["verdict"].str.contains("BEARISH").sum())
             neut_n = int((scan_df["verdict"] == "NEUTRAL / HOLD").sum())
-            trend_n = int((scan_df["buzz_score"] > 0).sum())
+            gated_n = int((scan_df["verdict"] == "NO EDGE / GATED").sum())
+            gross_alloc = float(scan_df["alloc_pct"].abs().sum())
 
             s1, s2, s3, s4, s5 = st.columns(5)
             s1.metric("Assets Predicted", len(scan_df), f"Skipped: {len(skipped_map)}")
-            s2.metric("Bullish Signals", bull_n)
-            s3.metric("Bearish Signals", bear_n)
-            s4.metric("Neutral / Below Hurdle", neut_n)
-            s5.metric("Buzzed / News Active", trend_n, f"Trending: {len(trending_df)}")
+            s2.metric("Bullish / Bearish", f"{bull_n} / {bear_n}", f"Gross Alloc: {gross_alloc:.1f}%")
+            s3.metric("Neutral / Below Hurdle", neut_n)
+            s4.metric("Gated (No Proven Alpha)", gated_n)
+            s5.metric("Buzzed / News Active", int((scan_df["buzz_score"] > 0).sum()), f"Trending: {len(trending_df)}")
 
             f_col1, f_col2, f_col3 = st.columns([1.2, 1.2, 1.3])
             with f_col1:
@@ -309,7 +316,7 @@ def main() -> None:
 
             view_df = scan_df[scan_df["market"].isin(mkt_filter)].copy()
             if sig_filter == "Actionable Only (Bullish/Bearish)":
-                view_df = view_df[view_df["verdict"] != "NEUTRAL / HOLD"]
+                view_df = view_df[~view_df["verdict"].isin({"NEUTRAL / HOLD", "NO EDGE / GATED"})]
             elif sig_filter == "Bullish Only":
                 view_df = view_df[view_df["verdict"].str.contains("BULLISH")]
             elif sig_filter == "Bearish Only":
@@ -318,7 +325,11 @@ def main() -> None:
                 view_df = view_df[view_df["buzz_score"] > 0]
 
             if log_top_btn:
-                actionable_tickers = scan_df[scan_df["verdict"] != "NEUTRAL / HOLD"]["ticker"].head(12).tolist()
+                actionable_tickers = (
+                    scan_df[~scan_df["verdict"].isin({"NEUTRAL / HOLD", "NO EDGE / GATED"})]["ticker"]
+                    .head(12)
+                    .tolist()
+                )
                 if actionable_tickers:
                     with st.spinner("Logging closed-bar signals for top actionable stocks..."):
                         events = log_paper_signals(
@@ -328,10 +339,12 @@ def main() -> None:
                             use_cache=True,
                         )
                     st.success(f"Logged/checked {len(events)} closed-bar signals in Live Paper Tracker.")
+                else:
+                    st.info("No actionable non-gated signals available to log for this horizon.")
 
             st.dataframe(view_df, width="stretch", hide_index=True)
 
-            actionable_plot = view_df[view_df["verdict"] != "NEUTRAL / HOLD"].head(16)
+            actionable_plot = view_df[~view_df["verdict"].isin({"NEUTRAL / HOLD", "NO EDGE / GATED"})].head(16)
             if not actionable_plot.empty:
                 fig_scan = px.bar(
                     actionable_plot.sort_values("composite_ret_pct"),
@@ -403,9 +416,10 @@ def main() -> None:
                 tr = report.backtest_track_record
                 st.caption(
                     f"Historical Out-of-Sample Walk-Forward Track Record ({horizon_name}): "
-                    f"Sharpe = {tr.get('sharpe')} (95% CI [{tr.get('sharpe_ci_low')}, {tr.get('sharpe_ci_high')}]), "
-                    f"Spearman IC = {tr.get('spearman_ic')}, ROC-AUC = {tr.get('roc_auc')}, "
-                    f"Max Drawdown = {tr.get('max_drawdown_pct')}%, p-value = {tr.get('p_value')} -> **{tr.get('edge_verdict')}**"
+                    f"Sharpe = {tr.get('sharpe')} (95% Block-CI [{tr.get('sharpe_ci_low')}, {tr.get('sharpe_ci_high')}]), "
+                    f"Alpha = {tr.get('alpha_ann_pct')}% (HAC t={tr.get('hac_t_stat')}, DSR={tr.get('dsr_prob')}), "
+                    f"Spearman IC = {tr.get('spearman_ic')}, Max Drawdown = {tr.get('max_drawdown_pct')}% -> "
+                    f"**{tr.get('edge_verdict')}** ({report.gate_reason})"
                 )
 
             col_l, col_r = st.columns(2)

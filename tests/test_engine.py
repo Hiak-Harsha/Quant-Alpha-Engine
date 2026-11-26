@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from quant_alpha.backtest.engine import run_backtest_comparison
 from quant_alpha.config import HORIZON_CONFIGS, EngineSettings
 from quant_alpha.data.validator import validate_ohlcv_df
 from quant_alpha.features.pipeline import build_universe_dataset
-from quant_alpha.features.regime import MarketRegimeDetector
 from quant_alpha.features.sentiment import score_headline
 from quant_alpha.features.technical import compute_technical_features
 from quant_alpha.features.volatility import compute_volatility_features
@@ -326,3 +326,166 @@ def test_trending_symbol_filter_and_universes() -> None:
     ohlcv_mod["USDINR=X"] = u_mod
     cf2 = build_cross_asset_features("GOLDBEES.NS", gold_df, ohlcv_mod)
     pd.testing.assert_frame_equal(cf1, cf2)
+
+
+def test_planted_feature_leak_and_daily_feature_hygiene() -> None:
+    from quant_alpha.config import HORIZON_CONFIGS
+    from quant_alpha.features.pipeline import (
+        assert_causal_features,
+        build_asset_feature_frame,
+        build_universe_dataset,
+    )
+    from quant_alpha.features.technical import compute_technical_features
+
+    df = _synthetic_ohlcv(180, seed=55)
+    daily_tech = compute_technical_features(df, is_intraday=False)
+    assert "hour_sin" not in daily_tech.columns
+    assert "hour_cos" not in daily_tech.columns
+
+    ohlcv_map = {"RELIANCE.NS": df, "TCS.NS": _synthetic_ohlcv(180, seed=56), "SPY": _synthetic_ohlcv(180, seed=57)}
+    hcfg = HORIZON_CONFIGS["swing"]
+    ds = build_universe_dataset(["RELIANCE.NS", "TCS.NS"], ohlcv_map, macro_df=None, horizon_cfg=hcfg)
+    assert "asset_id" not in ds.feature_cols
+
+    # Causal pipeline must pass assert_causal_features cleanly
+    assert_causal_features(
+        lambda d: build_asset_feature_frame("RELIANCE.NS", d, {"RELIANCE.NS": d}, None, hcfg),
+        df,
+        cutoff_idx=-10,
+    )
+
+    # Planted look-ahead leak (peeking at t+1 close) must be caught and raise AssertionError
+    def leaky_builder(d: pd.DataFrame) -> pd.DataFrame:
+        out = compute_technical_features(d, is_intraday=False)
+        out["planted_future_ret"] = d["Close"].shift(-1) / d["Close"] - 1.0
+        return out
+
+    with pytest.raises(AssertionError, match="planted_future_ret"):
+        assert_causal_features(leaky_builder, df, cutoff_idx=-10)
+
+
+def test_portfolio_construction_constraints_and_cash_long_only() -> None:
+    from quant_alpha.config import PortfolioConfig
+    from quant_alpha.portfolio.construct import apply_portfolio_constraints, construct_portfolio_weights_df
+
+    cfg = PortfolioConfig(
+        max_gross_exposure=1.0,
+        max_net_exposure=1.0,
+        max_single_asset_weight=0.15,
+        max_cluster_weight=0.25,
+        max_sector_weight=0.35,
+        long_only_cash_india=True,
+    )
+    raw = pd.Series(
+        {
+            "RELIANCE.NS": -0.60,     # Indian cash short attempt -> must clamp to 0.0
+            "GOLDBEES.NS": 0.40,
+            "HDFCGOLD.NS": 0.40,
+            "GOLDCASE.NS": 0.40,
+            "GLD": -0.30,             # Non-Indian ETF may short
+            "HDFCBANK.NS": 0.50,
+            "ICICIBANK.NS": 0.50,
+            "SBIN.NS": 0.50,
+            "TCS.NS": 0.50,
+            "INFY.NS": 0.50,
+            "SPY": 0.40,
+        }
+    )
+    w = apply_portfolio_constraints(raw, cfg)
+    assert w["RELIANCE.NS"] == 0.0
+    assert w["GLD"] <= 0.0
+    assert float(w.abs().max()) <= cfg.max_single_asset_weight + 1e-9
+    gold_cluster_gross = float(w[["GOLDBEES.NS", "HDFCGOLD.NS", "GOLDCASE.NS", "GLD"]].abs().sum())
+    assert gold_cluster_gross <= cfg.max_cluster_weight + 1e-9
+    banks_sector_gross = float(w[["HDFCBANK.NS", "ICICIBANK.NS", "SBIN.NS"]].abs().sum())
+    assert banks_sector_gross <= cfg.max_sector_weight + 1e-9
+    assert float(w.abs().sum()) <= cfg.max_gross_exposure + 1e-9
+    assert float(abs(w.sum())) <= cfg.max_net_exposure + 1e-9
+
+    wide_df = pd.DataFrame([raw, raw * 0.5], index=pd.date_range("2026-01-01", periods=2, freq="B"))
+    w_wide = construct_portfolio_weights_df(wide_df, cfg)
+    assert (w_wide["RELIANCE.NS"] >= 0.0).all()
+    assert (w_wide.abs().sum(axis=1) <= cfg.max_gross_exposure + 1e-9).all()
+
+
+def test_backtester_accounting_benchmark_metrics_and_gating() -> None:
+    from quant_alpha.backtest.engine import _simulate_model_portfolio, run_backtest_comparison
+    from quant_alpha.backtest.metrics import evaluate_asset_pass_gate, evaluate_pass_gate_from_metrics
+    from quant_alpha.config import HORIZON_CONFIGS, EngineSettings, PassGateConfig, PortfolioConfig
+
+    dates = pd.bdate_range("2026-01-01", periods=4)
+    # Deterministic 1-asset test where weight at t=0..2 earns exact known returns at t=1..3
+    toy_oof = pd.DataFrame(
+        {
+            "Timestamp": dates,
+            "ticker": ["SPY"] * 4,
+            "bar_ret_1": [0.00, 0.02, -0.01, 0.03],
+            "est_ann_vol": [0.15] * 4,
+            "horizon_vol": [0.02] * 4,
+            "prob_regime_crisis": [0.0] * 4,
+            "target_fwd_ret": [0.02, -0.01, 0.03, 0.01],
+            "target_up": [1.0, 0.0, 1.0, 1.0],
+            "pred_vol_ridge": [0.5, 0.5, 0.5, 0.0],
+            "prob_up_ridge": [0.8, 0.8, 0.8, 0.5],
+            "pred_vol_ensemble": [0.5, 0.5, 0.5, 0.0],
+            "prob_up_ensemble": [0.8, 0.8, 0.8, 0.5],
+        }
+    )
+    hcfg = HORIZON_CONFIGS["swing"]
+    settings = EngineSettings(
+        bootstrap_samples=20,
+        portfolio=PortfolioConfig(max_single_asset_weight=1.0, max_cluster_weight=1.0, max_sector_weight=1.0, max_gross_exposure=1.0),
+    )
+    net_ret, turnover = _simulate_model_portfolio(toy_oof, "pred_vol_ensemble", "prob_up_ensemble", hcfg, settings, settings.portfolio)
+    # At t=0: weight > 0 decided; at t=1 earns +0.02 * w0 - cost(dw)
+    assert turnover.iloc[0] > 0.0
+    assert np.isclose(net_ret.iloc[0], -turnover.iloc[0] * ((hcfg.tx_cost_bps + hcfg.slippage_bps) / 10000.0))
+
+    # Full run_backtest_comparison check on synthetic 30-bar OOF data
+    rng = np.random.default_rng(7)
+    n_bars = 35
+    d_idx = pd.bdate_range("2025-06-01", periods=n_bars)
+    rows = []
+    for t in ("SPY", "RELIANCE.NS"):
+        rets = rng.normal(0.001, 0.01, size=n_bars)
+        for i in range(n_bars):
+            rows.append(
+                {
+                    "Timestamp": d_idx[i],
+                    "ticker": t,
+                    "bar_ret_1": rets[i],
+                    "est_ann_vol": 0.15,
+                    "horizon_vol": 0.02,
+                    "prob_regime_crisis": 0.1,
+                    "target_fwd_ret": rets[i],
+                    "target_up": float(rets[i] > 0),
+                    "pred_vol_ridge": 0.25 if i % 2 == 0 else -0.25,
+                    "prob_up_ridge": 0.6 if i % 2 == 0 else 0.4,
+                    "pred_vol_ensemble": 0.25 if i % 2 == 0 else -0.25,
+                    "prob_up_ensemble": 0.6 if i % 2 == 0 else 0.4,
+                }
+            )
+    bt = run_backtest_comparison(pd.DataFrame(rows), ["ridge"], hcfg, settings)
+    lb = bt.leaderboard.set_index("strategy")
+    assert lb.loc["Buy & Hold (Equal Weight)", "edge_verdict"] == "Benchmark (Not Rated)"
+    assert "Buy & Hold (Vol-Matched)" in lb.index
+    assert {"alpha_ann_pct", "beta_to_bh", "hac_t_stat", "dsr_prob", "always_long_hit_pct", "hit_edge_pct", "gate_passed"}.issubset(lb.columns)
+
+    # PassGate tests
+    gate_cfg = PassGateConfig(enable_pass_gate=True, min_alpha_ann_pct=0.0, min_hac_tstat=2.0, min_dsr_prob=0.95)
+    ok_fail, _ = evaluate_pass_gate_from_metrics({"alpha_ann_pct": -1.5, "hac_t_stat": 0.5, "dsr_prob": 0.40}, gate_cfg)
+    assert ok_fail is False
+    ok_pass, _ = evaluate_pass_gate_from_metrics({"alpha_ann_pct": 4.5, "hac_t_stat": 2.4, "dsr_prob": 0.97}, gate_cfg)
+    assert ok_pass is True
+    asset_ok, _ = evaluate_asset_pass_gate({"sharpe": 1.2, "hit_edge_pct": 2.0}, horizon_passed=False, horizon_reason="failed", pass_gate=gate_cfg)
+    assert asset_ok is False
+
+
+def test_live_functions_default_closed_bars_only() -> None:
+    import inspect
+
+    from quant_alpha.predictor import predict_asset, scan_market_predictions
+
+    assert inspect.signature(predict_asset).parameters["closed_bars_only"].default is True
+    assert inspect.signature(scan_market_predictions).parameters["closed_bars_only"].default is True
+

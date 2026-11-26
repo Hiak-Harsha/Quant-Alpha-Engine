@@ -140,6 +140,7 @@ def build_cross_asset_features(
             feat[f"corr63_{alias}"] = 1.0
 
     # Market Beta & Idiosyncratic Alpha (use NIFTY 50 for Indian assets when present, SPY otherwise)
+    bench_alias: Optional[str]
     if target_is_asia and "nsei" in aligned_closes:
         bench_alias = "nsei"
     else:

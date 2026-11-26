@@ -49,7 +49,7 @@ def _rolling_causal_garch(
                 try:
                     with warnings.catch_warnings():
                         warnings.simplefilter("ignore")
-                        am = arch_model(hist, vol="Garch", p=1, q=1, mean="Zero", rescale=False)
+                        am = arch_model(hist, vol="garch", p=1, q=1, mean="zero", rescale=False)
                         res = am.fit(disp="off", show_warning=False)
                         params = res.params
                         o = float(params.get("omega", omega))
@@ -57,9 +57,9 @@ def _rolling_causal_garch(
                         b = float(params.get("beta[1]", beta))
                         if o > 0 and a >= 0 and b >= 0 and (a + b) < 0.995:
                             omega, alpha, beta = o, a, b
-                            cond_vol = res.conditional_volatility
-                            if len(cond_vol) > 0 and np.isfinite(cond_vol.iloc[-1]):
-                                sigma2 = float(cond_vol.iloc[-1] ** 2)
+                            cond_vol = np.asarray(res.conditional_volatility, dtype=float)
+                            if len(cond_vol) > 0 and np.isfinite(cond_vol[-1]):
+                                sigma2 = float(cond_vol[-1] ** 2)
                 except Exception:
                     pass
 

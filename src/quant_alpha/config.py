@@ -2,16 +2,18 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Dict, List
-
+from typing import Dict, List, Tuple
 
 PACKAGE_ROOT = Path(__file__).resolve().parent
 PROJECT_ROOT = PACKAGE_ROOT.parent.parent
 DATA_CACHE_DIR = PROJECT_ROOT / "data_cache"
 ARTIFACTS_DIR = PROJECT_ROOT / "artifacts"
 REPORTS_DIR = PROJECT_ROOT / "reports"
+LOGS_DIR = PROJECT_ROOT / "logs"
 
 
 @dataclass(frozen=True)
@@ -207,18 +209,69 @@ RSS_FEEDS: Dict[str, str] = {
 
 
 @dataclass
+class PortfolioConfig:
+    """Portfolio construction constraints shared across backtester and live scan."""
+
+    max_gross_exposure: float = 1.0
+    max_net_exposure: float = 1.0
+    max_single_asset_weight: float = 0.15
+    max_cluster_weight: float = 0.25
+    max_sector_weight: float = 0.35
+    long_only_cash_india: bool = True
+    cash_long_only_suffixes: Tuple[str, ...] = (".NS", ".BO")
+    cash_long_only_tickers: Tuple[str, ...] = ("^NSEI", "^NSEBANK", "^CNXIT", "INDA")
+
+
+@dataclass
+class PassGateConfig:
+    """Pre-registered statistical edge gates required before emitting live directional verdicts."""
+
+    enable_pass_gate: bool = True
+    min_alpha_ann_pct: float = 0.0
+    min_hac_tstat: float = 2.0
+    min_dsr_prob: float = 0.95
+    min_asset_sharpe: float = 0.0
+    min_asset_hit_edge_pct: float = 0.0
+
+
+@dataclass
+class VerdictConfig:
+    """Config-driven signal, sizing, and sentiment thresholds (no magic numbers in code)."""
+
+    strong_vol_norm_threshold: float = 0.30
+    strong_agreement_pct: float = 66.0
+    min_agreement_pct: float = 55.0
+    signal_tanh_scale: float = 3.0
+    conf_base: float = 0.65
+    conf_prob_slope: float = 0.70
+    crisis_damp_slope: float = 0.50
+    crisis_damp_floor: float = 0.40
+    min_vol_scale: float = 0.35
+    atr_stop_mult: float = 1.5
+    atr_tp_mult: float = 2.5
+    neutral_tp_mult: float = 2.0
+    news_min_articles: int = 2
+    news_nudge_scale: float = 0.30
+    news_blend_weight: float = 0.15
+
+
+@dataclass
 class EngineSettings:
     """Runtime settings for training, tuning, and inference."""
 
     cache_ttl_hours_daily: float = 6.0
     cache_ttl_hours_intraday: float = 0.5
     cache_ttl_hours_news: float = 0.5
-    n_optuna_trials: int = 20
+    n_optuna_trials: int = 12
     random_state: int = 42
-    max_leverage: float = 1.5
+    max_leverage: float = 1.0
     min_signal_threshold: float = 0.05
     bootstrap_samples: int = 500
+    bootstrap_block_len: int = 5
     enable_shap: bool = True
+    portfolio: PortfolioConfig = field(default_factory=PortfolioConfig)
+    pass_gate: PassGateConfig = field(default_factory=PassGateConfig)
+    verdicts: VerdictConfig = field(default_factory=VerdictConfig)
     ticker_timezone_hints: Dict[str, str] = field(
         default_factory=lambda: {
             ".NS": "Asia/Kolkata",
@@ -232,9 +285,35 @@ class EngineSettings:
 
 
 def ensure_directories() -> None:
-    """Create local cache, artifact, and report directories if absent."""
-    for directory in (DATA_CACHE_DIR, ARTIFACTS_DIR, REPORTS_DIR):
+    """Create local cache, artifact, report, and log directories if absent."""
+    for directory in (DATA_CACHE_DIR, ARTIFACTS_DIR, REPORTS_DIR, LOGS_DIR):
         directory.mkdir(parents=True, exist_ok=True)
+
+
+def configure_logging(level: int = logging.INFO) -> logging.Logger:
+    """Configure root console and rotating file logging for quant_alpha."""
+    ensure_directories()
+    root_logger = logging.getLogger("quant_alpha")
+    if root_logger.handlers:
+        root_logger.setLevel(level)
+        return root_logger
+
+    root_logger.setLevel(level)
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(fmt)
+    root_logger.addHandler(stream_handler)
+
+    file_handler = RotatingFileHandler(
+        LOGS_DIR / "quant_alpha.log",
+        maxBytes=5 * 1024 * 1024,
+        backupCount=3,
+        encoding="utf-8",
+    )
+    file_handler.setFormatter(fmt)
+    root_logger.addHandler(file_handler)
+    return root_logger
 
 
 def is_asia_india_ticker(ticker: str) -> bool:

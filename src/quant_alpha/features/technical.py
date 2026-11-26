@@ -144,9 +144,6 @@ def compute_technical_features(df: pd.DataFrame, is_intraday: bool = False) -> p
     if is_intraday:
         feat["hour_sin"] = np.sin(2.0 * np.pi * idx.hour / 24.0)
         feat["hour_cos"] = np.cos(2.0 * np.pi * idx.hour / 24.0)
-    else:
-        feat["hour_sin"] = 0.0
-        feat["hour_cos"] = 1.0
 
     # Classical Quant Signal Scores (interpretable rule-based components in [-1, +1])
     trend_raw = np.tanh(feat["dist_sma_50"].fillna(0.0) * 12.0 + feat["dist_sma_200"].fillna(0.0) * 6.0)

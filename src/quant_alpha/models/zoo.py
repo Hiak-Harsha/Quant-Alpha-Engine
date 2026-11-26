@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
@@ -16,7 +15,6 @@ from sklearn.neural_network import MLPClassifier, MLPRegressor
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import FunctionTransformer, RobustScaler
 from xgboost import XGBClassifier, XGBRegressor
-
 
 MODEL_DISPLAY_NAMES: Dict[str, str] = {
     "linear_ridge": "Ridge / Logistic Baseline",
@@ -104,22 +102,38 @@ def build_model_pair(
         return reg, clf
 
     if model_name == "lightgbm":
-        lgb_params = {
-            "n_estimators": int(p.get("n_estimators", 220)),
-            "learning_rate": float(p.get("learning_rate", 0.03)),
-            "num_leaves": int(p.get("num_leaves", 20)),
-            "max_depth": int(p.get("max_depth", 5)),
-            "min_child_samples": int(p.get("min_child_samples", 40)),
-            "subsample": float(p.get("subsample", 0.8)),
-            "subsample_freq": 1,
-            "colsample_bytree": float(p.get("colsample_bytree", 0.7)),
-            "reg_alpha": float(p.get("reg_alpha", 1.0)),
-            "reg_lambda": float(p.get("reg_lambda", 5.0)),
-            "random_state": random_state,
-            "n_jobs": -1,
-            "verbose": -1,
-        }
-        return LGBMRegressor(**lgb_params), LGBMClassifier(**lgb_params)
+        return (
+            LGBMRegressor(
+                n_estimators=int(p.get("n_estimators", 220)),
+                learning_rate=float(p.get("learning_rate", 0.03)),
+                num_leaves=int(p.get("num_leaves", 20)),
+                max_depth=int(p.get("max_depth", 5)),
+                min_child_samples=int(p.get("min_child_samples", 40)),
+                subsample=float(p.get("subsample", 0.8)),
+                subsample_freq=1,
+                colsample_bytree=float(p.get("colsample_bytree", 0.7)),
+                reg_alpha=float(p.get("reg_alpha", 1.0)),
+                reg_lambda=float(p.get("reg_lambda", 5.0)),
+                random_state=random_state,
+                n_jobs=-1,
+                verbose=-1,
+            ),
+            LGBMClassifier(
+                n_estimators=int(p.get("n_estimators", 220)),
+                learning_rate=float(p.get("learning_rate", 0.03)),
+                num_leaves=int(p.get("num_leaves", 20)),
+                max_depth=int(p.get("max_depth", 5)),
+                min_child_samples=int(p.get("min_child_samples", 40)),
+                subsample=float(p.get("subsample", 0.8)),
+                subsample_freq=1,
+                colsample_bytree=float(p.get("colsample_bytree", 0.7)),
+                reg_alpha=float(p.get("reg_alpha", 1.0)),
+                reg_lambda=float(p.get("reg_lambda", 5.0)),
+                random_state=random_state,
+                n_jobs=-1,
+                verbose=-1,
+            ),
+        )
 
     if model_name == "xgboost":
         xgb_params = {

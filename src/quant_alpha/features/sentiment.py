@@ -9,7 +9,6 @@ import numpy as np
 import pandas as pd
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
-
 # Financial lexicon adjustments calibrated for markets, earnings, and central banks
 FIN_LEXICON: Dict[str, float] = {
     "beat": 2.1,

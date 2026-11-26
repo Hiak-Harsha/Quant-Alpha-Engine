@@ -1,15 +1,16 @@
-"""Objective multi-model, volatility-aware, regime- and news-adjusted live prediction engine."""
+"""Objective multi-model, volatility-aware, regime-, portfolio-, and gate-aware live prediction engine."""
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 
 from quant_alpha.backtest.engine import run_backtest_comparison
+from quant_alpha.backtest.metrics import evaluate_asset_pass_gate, evaluate_pass_gate_from_metrics
 from quant_alpha.config import (
     ARTIFACTS_DIR,
     GLOBAL_DRIVERS,
@@ -17,7 +18,6 @@ from quant_alpha.config import (
     UNIVERSES,
     EngineSettings,
     HorizonConfig,
-    is_asia_india_ticker,
     is_crypto_ticker,
 )
 from quant_alpha.data.macro_feed import load_all_macro_series
@@ -29,6 +29,11 @@ from quant_alpha.features.regime import REGIME_LABELS
 from quant_alpha.features.sentiment import compute_news_sentiment_summary, score_news_dataframe
 from quant_alpha.models.ensemble import load_ensemble_artifacts, train_and_evaluate_walkforward
 from quant_alpha.models.zoo import MODEL_DISPLAY_NAMES
+from quant_alpha.portfolio.construct import (
+    apply_portfolio_constraints,
+    compute_signal_raw_weights,
+    is_cash_long_only_asset,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +70,10 @@ class LivePredictionReport:
     cross_asset_snapshot: Dict[str, Optional[float]]
     backtest_track_record: Dict[str, Any] = field(default_factory=dict)
     in_training_universe: bool = True
+    gate_passed: bool = True
+    gate_reason: str = ""
+    raw_verdict: str = ""
+    raw_target_weight: float = 0.0
 
 
 def _local_shap_drivers(lgb_model: Any, X_row: pd.DataFrame, top_n: int = 8) -> List[Dict[str, Any]]:
@@ -105,7 +114,7 @@ def ensure_horizon_bundle(
     settings: Optional[EngineSettings] = None,
     force_retrain: bool = False,
 ) -> Dict[str, Any]:
-    """Load a trained horizon bundle or train it cleanly if absent."""
+    """Load saved models for a horizon, or train/backtest them if missing or requested."""
     settings = settings or EngineSettings()
     if not force_retrain:
         try:
@@ -114,17 +123,18 @@ def ensure_horizon_bundle(
             pass
 
     horizon_cfg = HORIZON_CONFIGS[horizon_name]
-    tickers = UNIVERSES.get(universe_name, UNIVERSES["india_market_gold_silver"])
-    all_tickers = list(dict.fromkeys(tickers + GLOBAL_DRIVERS))
+    target_tickers = UNIVERSES.get(universe_name, UNIVERSES["india_market_gold_silver"])
+    all_fetch = list(dict.fromkeys(target_tickers + GLOBAL_DRIVERS))
+
     ohlcv_map, _ = fetch_universe_ohlcv(
-        all_tickers,
+        all_fetch,
         period=horizon_cfg.period,
         interval=horizon_cfg.interval,
-        max_workers=10,
         settings=settings,
     )
     macro_df = load_all_macro_series(settings=settings)
-    dataset = build_universe_dataset(tickers, ohlcv_map, macro_df, horizon_cfg)
+    dataset = build_universe_dataset(target_tickers, ohlcv_map, macro_df, horizon_cfg)
+
     train_and_evaluate_walkforward(
         dataset=dataset,
         horizon_cfg=horizon_cfg,
@@ -134,6 +144,70 @@ def ensure_horizon_bundle(
         save_artifacts=True,
     )
     return load_ensemble_artifacts(horizon_name)
+
+
+def _load_or_compute_track_record(
+    horizon_name: str,
+    bundle: Dict[str, Any],
+    horizon_cfg: HorizonConfig,
+    model_names: List[str],
+    settings: EngineSettings,
+) -> Tuple[Dict[str, Any], Dict[str, Dict[str, Any]], bool, str]:
+    """Load Phase 0 benchmark-relative OOS leaderboard & per-asset summary, recomputing stale caches."""
+    hdir = ARTIFACTS_DIR / horizon_name
+    lb_cache = hdir / "leaderboard.parquet"
+    as_cache = hdir / "per_asset_summary.parquet"
+
+    lb_df: Optional[pd.DataFrame] = None
+    asset_df: Optional[pd.DataFrame] = None
+    if lb_cache.exists() and as_cache.exists():
+        try:
+            lb_cand = pd.read_parquet(lb_cache)
+            as_cand = pd.read_parquet(as_cache)
+            if (
+                {"alpha_ann_pct", "hac_t_stat", "dsr_prob", "gate_passed"}.issubset(lb_cand.columns)
+                and {"hit_edge_pct", "gate_passed"}.issubset(as_cand.columns)
+            ):
+                lb_df, asset_df = lb_cand, as_cand
+        except Exception:
+            lb_df, asset_df = None, None
+
+    if lb_df is None or asset_df is None:
+        oof_df = bundle.get("oof_predictions")
+        if oof_df is not None and not oof_df.empty:
+            bt_settings = EngineSettings(
+                bootstrap_samples=min(150, settings.bootstrap_samples),
+                bootstrap_block_len=settings.bootstrap_block_len,
+                random_state=settings.random_state,
+                max_leverage=settings.max_leverage,
+                min_signal_threshold=settings.min_signal_threshold,
+                portfolio=settings.portfolio,
+                pass_gate=settings.pass_gate,
+                verdicts=settings.verdicts,
+            )
+            bt = run_backtest_comparison(oof_df, model_names, horizon_cfg, bt_settings)
+            lb_df = bt.leaderboard
+            asset_df = bt.per_asset_summary
+            try:
+                hdir.mkdir(parents=True, exist_ok=True)
+                lb_df.to_parquet(lb_cache, index=False)
+                bt.equity_curves.to_parquet(hdir / "equity_curves.parquet")
+                bt.drawdown_curves.to_parquet(hdir / "drawdown_curves.parquet")
+                asset_df.to_parquet(as_cache, index=False)
+            except Exception:
+                pass
+
+    track_record: Dict[str, Any] = {}
+    per_asset_map: Dict[str, Dict[str, Any]] = {}
+    if lb_df is not None and not lb_df.empty:
+        ens_row = lb_df[lb_df["strategy"] == "Meta-Ensemble (Blended)"]
+        if not ens_row.empty:
+            track_record = ens_row.iloc[0].to_dict()
+    if asset_df is not None and not asset_df.empty:
+        per_asset_map = asset_df.set_index("ticker").to_dict(orient="index")
+
+    horizon_passed, horizon_reason = evaluate_pass_gate_from_metrics(track_record, settings.pass_gate)
+    return track_record, per_asset_map, horizon_passed, horizon_reason
 
 
 def predict_asset(
@@ -146,15 +220,16 @@ def predict_asset(
     scored_news: Optional[pd.DataFrame] = None,
     bundle: Optional[Dict[str, Any]] = None,
     use_cache: bool = True,
-    closed_bars_only: bool = False,
+    closed_bars_only: bool = True,
     compute_shap: bool = True,
+    _track_cache: Optional[Tuple[Dict[str, Any], Dict[str, Dict[str, Any]], bool, str]] = None,
 ) -> LivePredictionReport:
-    """Generate an objective multi-model, volatility-, regime-, and news-aware forecast."""
+    """Generate an objective multi-model, volatility-, regime-, gate-, and constraint-aware forecast."""
     settings = settings or EngineSettings()
+    vcfg = settings.verdicts
     horizon_cfg: HorizonConfig = HORIZON_CONFIGS[horizon_name]
     bundle = bundle or ensure_horizon_bundle(horizon_name, universe_name=universe_name, settings=settings)
 
-    # Fetch live/cached data if not passed in
     if ohlcv_map is None:
         fetch_list = list(dict.fromkeys([ticker] + GLOBAL_DRIVERS))
         ohlcv_map, _ = fetch_universe_ohlcv(
@@ -184,7 +259,6 @@ def predict_asset(
     if target_df is None or len(target_df) < 70:
         raise ValueError(f"Insufficient price history for '{ticker}' on {horizon_name} ({horizon_cfg.interval}).")
 
-    # Live inference only needs a causal lookback window (max 252-bar stats + GARCH warm-up)
     if len(target_df) > 360:
         target_df = target_df.tail(360)
     inference_ohlcv_map = {
@@ -200,7 +274,6 @@ def predict_asset(
         raw_news = fetch_all_news([ticker] + UNIVERSES.get(universe_name, [])[:30], use_cache=use_cache, settings=settings)
         scored_news = score_news_dataframe(raw_news)
 
-    # Build full causal feature frame for target ticker
     asset_frame = build_asset_feature_frame(
         ticker=ticker,
         ohlcv_df=target_df,
@@ -208,9 +281,8 @@ def predict_asset(
         macro_df=macro_df,
         horizon_cfg=horizon_cfg,
     )
-    ticker_to_id: Dict[str, float] = bundle.get("ticker_to_id", {})
-    in_universe = ticker in ticker_to_id
-    asset_frame["asset_id"] = float(ticker_to_id.get(ticker, np.median(list(ticker_to_id.values())) if ticker_to_id else 0.0))
+    ticker_to_id: Dict[str, Any] = bundle.get("ticker_to_id", {})
+    in_universe = ticker in ticker_to_id or ticker in UNIVERSES.get(universe_name, [])
 
     regime_detector = bundle["final_regime_detector"]
     regime_df = regime_detector.predict_proba(asset_frame)
@@ -232,7 +304,6 @@ def predict_asset(
     horizon_vol = float(latest_row["horizon_vol"].iloc[0])
     atr_pct = float(latest_row["atr_14_pct"].iloc[0]) if pd.notna(latest_row["atr_14_pct"].iloc[0]) else 0.015
 
-    # Run every model in the zoo
     model_names: List[str] = bundle["model_names"]
     weights: Dict[str, float] = bundle["ensemble_weights"]
     final_models: Dict[str, Any] = bundle["final_models"]
@@ -259,7 +330,11 @@ def predict_asset(
                 "pred_vol_norm": round(p_vol, 3),
                 "expected_ret_pct": round(p_ret, 2),
                 "prob_up_pct": round(p_up * 100.0, 1),
-                "signal": "BULLISH" if p_vol > 0.05 else ("BEARISH" if p_vol < -0.05 else "NEUTRAL"),
+                "signal": (
+                    "BULLISH"
+                    if p_vol > settings.min_signal_threshold
+                    else ("BEARISH" if p_vol < -settings.min_signal_threshold else "NEUTRAL")
+                ),
             }
         )
 
@@ -273,13 +348,12 @@ def predict_asset(
     ens_sign = np.sign(quant_pred_vol) if abs(quant_pred_vol) > 1e-4 else 1.0
     agreement_pct = float((np.sign(pv_arr) == ens_sign).mean() * 100.0)
 
-    # News & Macro Sentiment Overlay (transparent separation from pure historical quant score)
     news_summary = compute_news_sentiment_summary(scored_news, ticker)
     total_articles = news_summary["asset_article_count"] + news_summary["macro_article_count"]
     sent_score = float(news_summary["composite_sentiment"])
-    if total_articles >= 2:
-        news_vol_nudge = sent_score * 0.30
-        composite_pred_vol = 0.85 * quant_pred_vol + 0.15 * news_vol_nudge
+    if total_articles >= vcfg.news_min_articles:
+        news_vol_nudge = sent_score * vcfg.news_nudge_scale
+        composite_pred_vol = (1.0 - vcfg.news_blend_weight) * quant_pred_vol + vcfg.news_blend_weight * news_vol_nudge
     else:
         composite_pred_vol = quant_pred_vol
 
@@ -289,21 +363,19 @@ def predict_asset(
     range_low = comp_ret_pct - sigma_pct
     range_high = comp_ret_pct + sigma_pct
 
-    # Cost hurdle = round-trip transaction cost + slippage
     hurdle_pct = 2.0 * (horizon_cfg.tx_cost_bps + horizon_cfg.slippage_bps) / 100.0
 
-    if abs(comp_ret_pct) < hurdle_pct or agreement_pct < 55.0:
-        verdict = "NEUTRAL / HOLD"
-    elif composite_pred_vol >= 0.30 and agreement_pct >= 66.0:
-        verdict = "STRONG BULLISH"
+    if abs(comp_ret_pct) < hurdle_pct or agreement_pct < vcfg.min_agreement_pct:
+        raw_verdict = "NEUTRAL / HOLD"
+    elif composite_pred_vol >= vcfg.strong_vol_norm_threshold and agreement_pct >= vcfg.strong_agreement_pct:
+        raw_verdict = "STRONG BULLISH"
     elif composite_pred_vol > 0.0:
-        verdict = "LEAN BULLISH"
-    elif composite_pred_vol <= -0.30 and agreement_pct >= 66.0:
-        verdict = "STRONG BEARISH"
+        raw_verdict = "LEAN BULLISH"
+    elif composite_pred_vol <= -vcfg.strong_vol_norm_threshold and agreement_pct >= vcfg.strong_agreement_pct:
+        raw_verdict = "STRONG BEARISH"
     else:
-        verdict = "LEAN BEARISH"
+        raw_verdict = "LEAN BEARISH"
 
-    # Regime & Volatility-Targeted Position Sizing
     reg_state = int(round(float(latest_row["regime_state"].iloc[0])))
     regime_probs = {
         "Low-Vol Bull": round(float(latest_row["prob_regime_bull"].iloc[0]) * 100.0, 1),
@@ -311,25 +383,60 @@ def predict_asset(
         "High-Vol Crisis": round(float(latest_row["prob_regime_crisis"].iloc[0]) * 100.0, 1),
     }
 
-    if verdict == "NEUTRAL / HOLD":
-        alloc_pct = 0.0
-        stop_price = last_close * (1.0 - 1.5 * atr_pct)
-        tp_price = last_close * (1.0 + 2.0 * atr_pct)
+    if _track_cache is not None:
+        track_record, per_asset_map, horizon_passed, horizon_reason = _track_cache
     else:
-        conf_mult = 0.65 + 0.70 * abs(quant_prob_up - 0.5)
-        vol_scale = float(np.clip(horizon_cfg.target_vol_annual / max(est_ann_vol, 0.05), 0.35, settings.max_leverage))
-        crisis_damp = float(np.clip(1.0 - 0.50 * float(latest_row["prob_regime_crisis"].iloc[0]), 0.40, 1.0))
-        raw_alloc = float(np.tanh(composite_pred_vol * 3.0) * conf_mult * vol_scale * crisis_damp)
-        alloc_pct = round(float(np.clip(raw_alloc, -settings.max_leverage, settings.max_leverage)) * 100.0, 1)
-        direction = 1.0 if composite_pred_vol > 0 else -1.0
-        stop_price = last_close * (1.0 - direction * 1.5 * atr_pct)
-        tp_price = last_close * (1.0 + direction * 2.5 * atr_pct)
+        track_record, per_asset_map, horizon_passed, horizon_reason = _load_or_compute_track_record(
+            horizon_name, bundle, horizon_cfg, model_names, settings
+        )
 
-    # Local SHAP drivers for transparency
+    asset_oos = per_asset_map.get(ticker)
+    gate_passed, gate_reason = evaluate_asset_pass_gate(
+        asset_oos,
+        horizon_passed=horizon_passed,
+        horizon_reason=horizon_reason,
+        pass_gate=settings.pass_gate,
+    )
+
+    if not gate_passed:
+        verdict = "NO EDGE / GATED"
+        raw_weight = 0.0
+        alloc_pct = 0.0
+        stop_price = last_close * (1.0 - vcfg.atr_stop_mult * atr_pct)
+        tp_price = last_close * (1.0 + vcfg.neutral_tp_mult * atr_pct)
+    elif raw_verdict == "NEUTRAL / HOLD":
+        verdict = raw_verdict
+        raw_weight = 0.0
+        alloc_pct = 0.0
+        stop_price = last_close * (1.0 - vcfg.atr_stop_mult * atr_pct)
+        tp_price = last_close * (1.0 + vcfg.neutral_tp_mult * atr_pct)
+    else:
+        verdict = raw_verdict
+        raw_weight = float(
+            compute_signal_raw_weights(
+                pred_vol=np.array([composite_pred_vol]),
+                prob_up=np.array([quant_prob_up]),
+                est_ann_vol=np.array([est_ann_vol]),
+                crisis_prob=np.array([float(latest_row["prob_regime_crisis"].iloc[0])]),
+                horizon_cfg=horizon_cfg,
+                settings=settings,
+            )[0]
+        )
+        # Cash Indian equities/ETFs cannot be shorted; convert bearish cash signals to flat/avoid
+        if is_cash_long_only_asset(ticker, settings.portfolio) and raw_weight < 0.0:
+            raw_weight = 0.0
+            alloc_pct = 0.0
+        else:
+            constrained = apply_portfolio_constraints(pd.Series({ticker: raw_weight}), settings.portfolio)
+            alloc_pct = round(float(constrained.iloc[0]) * 100.0, 1)
+
+        direction = 1.0 if composite_pred_vol > 0 else -1.0
+        stop_price = last_close * (1.0 - direction * vcfg.atr_stop_mult * atr_pct)
+        tp_price = last_close * (1.0 + direction * vcfg.atr_tp_mult * atr_pct)
+
     lgb_reg = final_models["lightgbm"][0] if "lightgbm" in final_models else None
     top_drivers = _local_shap_drivers(lgb_reg, X_live, top_n=8) if compute_shap else []
 
-    # Cross-asset correlation & macro snapshot
     cross_snap: Dict[str, Optional[float]] = {}
     for col in (
         "corr21_spy",
@@ -352,30 +459,6 @@ def predict_asset(
         if "vix_level" in latest_row.columns and pd.notna(latest_row["vix_level"].iloc[0])
         else None
     )
-
-    # Historical walk-forward track record for this horizon (use cached summary if available for speed)
-    track_record: Dict[str, Any] = {}
-    lb_cache = ARTIFACTS_DIR / horizon_name / "leaderboard.parquet"
-    if lb_cache.exists():
-        try:
-            lb_df = pd.read_parquet(lb_cache)
-            ens_row = lb_df[lb_df["strategy"] == "Meta-Ensemble (Blended)"]
-            if not ens_row.empty:
-                track_record = ens_row.iloc[0].to_dict()
-        except Exception:
-            pass
-    if not track_record:
-        oof_df = bundle.get("oof_predictions")
-        if oof_df is not None and not oof_df.empty:
-            bt = run_backtest_comparison(oof_df, model_names, horizon_cfg, EngineSettings(bootstrap_samples=100))
-            try:
-                lb_cache.parent.mkdir(parents=True, exist_ok=True)
-                bt.leaderboard.to_parquet(lb_cache, index=False)
-            except Exception:
-                pass
-            ens_row = bt.leaderboard[bt.leaderboard["strategy"] == "Meta-Ensemble (Blended)"]
-            if not ens_row.empty:
-                track_record = ens_row.iloc[0].to_dict()
 
     return LivePredictionReport(
         ticker=ticker,
@@ -406,6 +489,10 @@ def predict_asset(
         cross_asset_snapshot=cross_snap,
         backtest_track_record=track_record,
         in_training_universe=in_universe,
+        gate_passed=gate_passed,
+        gate_reason=gate_reason,
+        raw_verdict=raw_verdict,
+        raw_target_weight=raw_weight,
     )
 
 
@@ -413,6 +500,7 @@ def predict_multi_horizon_matrix(
     ticker: str,
     universe_name: str = "india_market_gold_silver",
     settings: Optional[EngineSettings] = None,
+    closed_bars_only: bool = True,
 ) -> List[LivePredictionReport]:
     """Generate side-by-side Intraday, Swing, and Long-Term objective predictions."""
     settings = settings or EngineSettings()
@@ -430,6 +518,7 @@ def predict_multi_horizon_matrix(
                 settings=settings,
                 macro_df=macro_df,
                 scored_news=scored_news,
+                closed_bars_only=closed_bars_only,
             )
         )
     return reports
@@ -475,14 +564,14 @@ def scan_market_predictions(
     include_trending: bool = True,
     max_trending_extras: int = 15,
     use_cache: bool = True,
-    closed_bars_only: bool = False,
+    closed_bars_only: bool = True,
     settings: Optional[EngineSettings] = None,
     ohlcv_map: Optional[Dict[str, pd.DataFrame]] = None,
     macro_df: Optional[pd.DataFrame] = None,
     scored_news: Optional[pd.DataFrame] = None,
     bundle: Optional[Dict[str, Any]] = None,
 ) -> MarketScanOutput:
-    """Actively scan and rank predictions across Indian shares, Gold/Silver ETFs & trending tickers."""
+    """Actively scan and rank predictions using portfolio constraints, long-only cash rules, and PassGate."""
     settings = settings or EngineSettings()
     horizon_cfg = HORIZON_CONFIGS[horizon_name]
     bundle = bundle or ensure_horizon_bundle(horizon_name, universe_name=universe_name, settings=settings)
@@ -543,6 +632,10 @@ def scan_market_predictions(
         else {}
     )
 
+    track_cache = _load_or_compute_track_record(
+        horizon_name, bundle, horizon_cfg, bundle["model_names"], settings
+    )
+
     rows: List[Dict[str, Any]] = []
     reports: Dict[str, LivePredictionReport] = {}
     skipped: Dict[str, str] = {}
@@ -561,47 +654,64 @@ def scan_market_predictions(
                 use_cache=use_cache,
                 closed_bars_only=closed_bars_only,
                 compute_shap=False,
+                _track_cache=track_cache,
             )
             reports[t] = rep
-            binfo = buzz_lookup.get(t, {})
-            t_df = ohlcv_map.get(t)
-            chg_1_pct = (
-                round(float(t_df["Close"].pct_change(1).iloc[-1] * 100.0), 2)
-                if t_df is not None and len(t_df) >= 2 and pd.notna(t_df["Close"].pct_change(1).iloc[-1])
-                else 0.0
-            )
-            is_actionable = 1 if rep.verdict != "NEUTRAL / HOLD" else 0
-            conviction_rank = abs(rep.composite_expected_ret_pct) * (rep.model_agreement_pct / 100.0)
-            rows.append(
-                {
-                    "ticker": t,
-                    "market": _classify_market_bucket(t),
-                    "buzz_score": float(binfo.get("buzz_score", 0.0)),
-                    "news_mentions": int(binfo.get("news_mentions", 0)),
-                    "trending_tags": str(binfo.get("sources", "")),
-                    "close": rep.last_close,
-                    "chg_1_pct": chg_1_pct,
-                    "verdict": rep.verdict,
-                    "composite_ret_pct": rep.composite_expected_ret_pct,
-                    "quant_ret_pct": rep.quant_expected_ret_pct,
-                    "prob_up_pct": rep.prob_up_pct,
-                    "consensus_pct": rep.model_agreement_pct,
-                    "garch_vol_pct": rep.garch_ann_vol_pct,
-                    "regime": rep.regime_label,
-                    "news_sent": float((rep.news_summary or {}).get("composite_sentiment", 0.0)),
-                    "alloc_pct": rep.suggested_allocation_pct,
-                    "stop_loss": rep.stop_loss_price,
-                    "take_profit": rep.take_profit_price,
-                    "in_universe": rep.in_training_universe,
-                    "_sort_act": is_actionable,
-                    "_sort_conv": round(conviction_rank, 4),
-                }
-            )
         except Exception as exc:
             skipped[t] = str(exc)
 
-    if not rows:
+    if not reports:
         return MarketScanOutput(pd.DataFrame(), trending_df, reports, skipped)
+
+    # Joint portfolio construction across all scanned assets (bounded by cluster, sector, gross/net & cash rules)
+    raw_series = pd.Series(
+        {
+            t: (0.0 if (not rep.gate_passed or rep.verdict in {"NEUTRAL / HOLD", "NO EDGE / GATED"}) else rep.raw_target_weight)
+            for t, rep in reports.items()
+        },
+        dtype=float,
+    )
+    portfolio_weights = apply_portfolio_constraints(raw_series, settings.portfolio)
+
+    for t, rep in reports.items():
+        alloc_pct = round(float(portfolio_weights.get(t, 0.0)) * 100.0, 1)
+        rep.suggested_allocation_pct = alloc_pct
+        binfo = buzz_lookup.get(t, {})
+        t_df = ohlcv_map.get(t)
+        chg_1_pct = (
+            round(float(t_df["Close"].pct_change(1).iloc[-1] * 100.0), 2)
+            if t_df is not None and len(t_df) >= 2 and pd.notna(t_df["Close"].pct_change(1).iloc[-1])
+            else 0.0
+        )
+        is_actionable = 1 if rep.verdict not in {"NEUTRAL / HOLD", "NO EDGE / GATED"} else 0
+        conviction_rank = abs(rep.composite_expected_ret_pct) * (rep.model_agreement_pct / 100.0)
+        rows.append(
+            {
+                "ticker": t,
+                "market": _classify_market_bucket(t),
+                "buzz_score": float(binfo.get("buzz_score", 0.0)),
+                "news_mentions": int(binfo.get("news_mentions", 0)),
+                "trending_tags": str(binfo.get("sources", "")),
+                "close": rep.last_close,
+                "chg_1_pct": chg_1_pct,
+                "verdict": rep.verdict,
+                "raw_verdict": rep.raw_verdict,
+                "gate_passed": rep.gate_passed,
+                "composite_ret_pct": rep.composite_expected_ret_pct,
+                "quant_ret_pct": rep.quant_expected_ret_pct,
+                "prob_up_pct": rep.prob_up_pct,
+                "consensus_pct": rep.model_agreement_pct,
+                "garch_vol_pct": rep.garch_ann_vol_pct,
+                "regime": rep.regime_label,
+                "news_sent": float((rep.news_summary or {}).get("composite_sentiment", 0.0)),
+                "alloc_pct": alloc_pct,
+                "stop_loss": rep.stop_loss_price,
+                "take_profit": rep.take_profit_price,
+                "in_universe": rep.in_training_universe,
+                "_sort_act": is_actionable,
+                "_sort_conv": round(conviction_rank, 4),
+            }
+        )
 
     scan_df = (
         pd.DataFrame(rows)

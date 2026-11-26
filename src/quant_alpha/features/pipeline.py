@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -121,6 +121,7 @@ def build_universe_dataset(
     meta_cols = {
         "Timestamp",
         "ticker",
+        "asset_id",
         "close_price",
         "bar_ret_1",
         "est_ann_vol",
@@ -142,3 +143,39 @@ def build_universe_dataset(
         feature_cols=valid_features,
         ticker_to_id={k: float(v) for k, v in ticker_to_id.items()},
     )
+
+
+def assert_causal_features(
+    feature_builder,
+    ohlcv_df: pd.DataFrame,
+    feature_cols: Optional[List[str]] = None,
+    cutoff_idx: int = -15,
+    atol: float = 1e-10,
+) -> None:
+    """Assert that perturbing future bars after cutoff_idx causes zero change at or before cutoff_idx."""
+    base_df = feature_builder(ohlcv_df)
+    perturbed = ohlcv_df.copy()
+    cut_pos = len(perturbed) + cutoff_idx if cutoff_idx < 0 else cutoff_idx
+    if cut_pos <= 5 or cut_pos >= len(perturbed) - 1:
+        raise ValueError("cutoff_idx must leave future rows after cut_pos to perturb.")
+
+    for col in ("Open", "High", "Low", "Close"):
+        if col in perturbed.columns:
+            perturbed.iloc[cut_pos + 1 :, perturbed.columns.get_loc(col)] *= 1.35
+    if "Volume" in perturbed.columns:
+        perturbed.iloc[cut_pos + 1 :, perturbed.columns.get_loc("Volume")] *= 2.5
+
+    mod_df = feature_builder(perturbed)
+    cols = feature_cols or [c for c in base_df.columns if not str(c).startswith("target_") and pd.api.types.is_numeric_dtype(base_df[c])]
+    leaks: List[str] = []
+    for col in cols:
+        a = base_df[col].iloc[: cut_pos + 1].to_numpy(dtype=float)
+        b = mod_df[col].iloc[: cut_pos + 1].to_numpy(dtype=float)
+        both_nan = np.isnan(a) & np.isnan(b)
+        diff_mask = ~both_nan & ~np.isclose(a, b, atol=atol, rtol=1e-7, equal_nan=False)
+        if np.any(diff_mask):
+            leaks.append(str(col))
+
+    if leaks:
+        raise AssertionError(f"Causal look-ahead leak detected in features: {leaks}")
+

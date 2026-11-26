@@ -515,7 +515,7 @@ class PaperLedger:
         if matured.empty:
             return pd.DataFrame()
 
-        per_model: Dict[str, List[Tuple[float, float, float]]] = {}
+        per_model: Dict[str, List[Tuple[float, float, float, float]]] = {}
         for _, row in matured.iterrows():
             actual = float(row["actual_asset_ret_pct"])
             try:
