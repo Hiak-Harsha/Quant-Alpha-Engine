@@ -100,7 +100,7 @@ def _local_shap_drivers(lgb_model: Any, X_row: pd.DataFrame, top_n: int = 8) -> 
 
 def ensure_horizon_bundle(
     horizon_name: str,
-    universe_name: str = "top_talked_leaders",
+    universe_name: str = "india_market_gold_silver",
     tune: bool = True,
     settings: Optional[EngineSettings] = None,
     force_retrain: bool = False,
@@ -114,7 +114,7 @@ def ensure_horizon_bundle(
             pass
 
     horizon_cfg = HORIZON_CONFIGS[horizon_name]
-    tickers = UNIVERSES.get(universe_name, UNIVERSES["top_talked_leaders"])
+    tickers = UNIVERSES.get(universe_name, UNIVERSES["india_market_gold_silver"])
     all_tickers = list(dict.fromkeys(tickers + GLOBAL_DRIVERS))
     ohlcv_map, _ = fetch_universe_ohlcv(
         all_tickers,
@@ -139,7 +139,7 @@ def ensure_horizon_bundle(
 def predict_asset(
     ticker: str,
     horizon_name: str = "swing",
-    universe_name: str = "top_talked_leaders",
+    universe_name: str = "india_market_gold_silver",
     settings: Optional[EngineSettings] = None,
     ohlcv_map: Optional[Dict[str, pd.DataFrame]] = None,
     macro_df: Optional[pd.DataFrame] = None,
@@ -411,7 +411,7 @@ def predict_asset(
 
 def predict_multi_horizon_matrix(
     ticker: str,
-    universe_name: str = "top_talked_leaders",
+    universe_name: str = "india_market_gold_silver",
     settings: Optional[EngineSettings] = None,
 ) -> List[LivePredictionReport]:
     """Generate side-by-side Intraday, Swing, and Long-Term objective predictions."""
@@ -445,19 +445,33 @@ class MarketScanOutput:
     skipped_tickers: Dict[str, str]
 
 
+_METALS_TICKERS = {
+    "GOLDBEES.NS", "HDFCGOLD.NS", "GOLDCASE.NS",
+    "SILVERBEES.NS", "SILVER.NS", "SILVERIETF.NS", "HDFCSILVER.NS",
+    "GLD", "SLV", "GC=F", "SI=F",
+}
+_INDIA_INDEX_ETFS = {
+    "^NSEI", "^NSEBANK", "^CNXIT", "NIFTYBEES.NS", "BANKBEES.NS", "JUNIORBEES.NS", "INDA",
+}
+_MACRO_FX_TICKERS = {"USDINR=X", "BZ=F", "USO", "TLT", "UUP", "HYG", "IEF"}
+
+
 def _classify_market_bucket(ticker: str) -> str:
-    if is_crypto_ticker(ticker):
-        return "Crypto"
-    if is_asia_india_ticker(ticker) or ticker.upper() == "INDA":
-        return "India / NSE"
-    if ticker.upper() in {"SPY", "QQQ", "IWM", "TLT", "GLD", "SLV", "USO", "XLK", "XLF", "XLE", "XLV", "XLI", "XLP", "XLY", "XLU"}:
-        return "ETF / Macro"
-    return "US Stock"
+    up = ticker.upper()
+    if up in _METALS_TICKERS:
+        return "Gold / Silver ETF"
+    if up in _INDIA_INDEX_ETFS:
+        return "India Index / ETF"
+    if up.endswith((".NS", ".BO")):
+        return "India Stock (.NS)"
+    if is_crypto_ticker(up) or up in _MACRO_FX_TICKERS:
+        return "Macro / FX / Crypto"
+    return "US Stock / ETF"
 
 
 def scan_market_predictions(
     horizon_name: str = "swing",
-    universe_name: str = "top_talked_leaders",
+    universe_name: str = "india_market_gold_silver",
     include_trending: bool = True,
     max_trending_extras: int = 15,
     use_cache: bool = True,
@@ -468,17 +482,18 @@ def scan_market_predictions(
     scored_news: Optional[pd.DataFrame] = None,
     bundle: Optional[Dict[str, Any]] = None,
 ) -> MarketScanOutput:
-    """Actively scan and rank predictions across top diversified & currently talked-about stocks."""
+    """Actively scan and rank predictions across Indian shares, Gold/Silver ETFs & trending tickers."""
     settings = settings or EngineSettings()
     horizon_cfg = HORIZON_CONFIGS[horizon_name]
     bundle = bundle or ensure_horizon_bundle(horizon_name, universe_name=universe_name, settings=settings)
 
-    base_tickers = list(UNIVERSES.get(universe_name, UNIVERSES["top_talked_leaders"]))
+    base_tickers = list(UNIVERSES.get(universe_name, UNIVERSES["india_market_gold_silver"]))
+    india_focus = universe_name.startswith("india_")
     if macro_df is None:
         macro_df = load_all_macro_series(use_cache=use_cache, settings=settings)
 
     if scored_news is None:
-        news_tickers = list(dict.fromkeys(base_tickers[:30]))
+        news_tickers = list(dict.fromkeys(base_tickers[:35]))
         scored_news = score_news_dataframe(fetch_all_news(news_tickers, use_cache=use_cache, settings=settings))
 
     trending_df = discover_trending_stocks(
@@ -486,12 +501,18 @@ def scan_market_predictions(
         candidate_tickers=base_tickers,
         use_cache=use_cache,
         settings=settings,
+        india_focus=india_focus,
     )
 
     scan_tickers = list(base_tickers)
     if include_trending and not trending_df.empty:
-        extras = [s for s in trending_df["symbol"].tolist() if s not in scan_tickers][:max_trending_extras]
-        scan_tickers.extend(extras)
+        cands = [s for s in trending_df["symbol"].tolist() if s not in scan_tickers]
+        if india_focus:
+            cands = [
+                s for s in cands
+                if s.endswith((".NS", ".BO")) or s in _METALS_TICKERS or s in _INDIA_INDEX_ETFS or s == "USDINR=X"
+            ]
+        scan_tickers.extend(cands[:max_trending_extras])
 
     if ohlcv_map is None:
         all_fetch = list(dict.fromkeys(scan_tickers + GLOBAL_DRIVERS))
@@ -543,6 +564,12 @@ def scan_market_predictions(
             )
             reports[t] = rep
             binfo = buzz_lookup.get(t, {})
+            t_df = ohlcv_map.get(t)
+            chg_1_pct = (
+                round(float(t_df["Close"].pct_change(1).iloc[-1] * 100.0), 2)
+                if t_df is not None and len(t_df) >= 2 and pd.notna(t_df["Close"].pct_change(1).iloc[-1])
+                else 0.0
+            )
             is_actionable = 1 if rep.verdict != "NEUTRAL / HOLD" else 0
             conviction_rank = abs(rep.composite_expected_ret_pct) * (rep.model_agreement_pct / 100.0)
             rows.append(
@@ -553,6 +580,7 @@ def scan_market_predictions(
                     "news_mentions": int(binfo.get("news_mentions", 0)),
                     "trending_tags": str(binfo.get("sources", "")),
                     "close": rep.last_close,
+                    "chg_1_pct": chg_1_pct,
                     "verdict": rep.verdict,
                     "composite_ret_pct": rep.composite_expected_ret_pct,
                     "quant_ret_pct": rep.quant_expected_ret_pct,

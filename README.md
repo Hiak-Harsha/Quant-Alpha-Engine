@@ -22,23 +22,27 @@ A diversified, multi-horizon quantitative market analysis, backtesting, and obje
 
 ## Quickstart
 ```powershell
-# 1. Validate all data, macro, and news feeds
-.venv\Scripts\python.exe -m quant_alpha.cli validate-feeds --horizon swing --universe top_talked_leaders
+# 1. Validate all data, macro, and India/US/metals feeds
+.venv\Scripts\python.exe -m quant_alpha.cli validate-feeds --horizon swing --universe india_market_gold_silver
 
-# 2. Train, tune (Optuna), and walk-forward backtest across top diversified stocks
-.venv\Scripts\python.exe -m quant_alpha.cli train-backtest --horizon swing --universe top_talked_leaders --trials 12
+# 2. Train, tune (Optuna), and walk-forward backtest across Indian equities & Gold/Silver ETFs
+.venv\Scripts\python.exe -m quant_alpha.cli train-backtest --horizon swing --universe india_market_gold_silver --trials 8
 
-# 3. Actively scan and rank predictions across top & currently trending stocks
-.venv\Scripts\python.exe -m quant_alpha.cli scan --horizon swing --universe top_talked_leaders
+# 3. Scan & rank signals for Indian shares, Gold/Silver ETFs, and trending tickers
+.venv\Scripts\python.exe -m quant_alpha.cli scan --horizon swing --universe india_market_gold_silver
 
-# 4. Generate deep-dive multi-horizon prediction for a specific ticker
-.venv\Scripts\python.exe -m quant_alpha.cli predict --ticker NVDA --all-horizons
+# 4. Run live terminal monitor (auto-refreshes signals, Gold/Silver spotlight, and logs/grades paper trades)
+.venv\Scripts\python.exe -m quant_alpha.cli monitor --universe india_market_gold_silver --horizon intraday --interval-sec 180 --auto-log
 
-# 5. Log & evaluate real-time paper trades (zero-leakage closed-bar ledger)
-.venv\Scripts\python.exe -m quant_alpha.cli paper-log --universe top_talked_leaders --horizons swing,intraday --refresh
+# 5. Deep-dive multi-horizon prediction for a specific NSE stock or Gold/Silver ETF
+.venv\Scripts\python.exe -m quant_alpha.cli predict --ticker GOLDBEES.NS --all-horizons
+.venv\Scripts\python.exe -m quant_alpha.cli predict --ticker RELIANCE.NS --all-horizons
+
+# 6. Log & evaluate real-time paper trades (zero-leakage closed-bar ledger)
+.venv\Scripts\python.exe -m quant_alpha.cli paper-log --universe india_market_gold_silver --horizons swing,intraday --refresh
 .venv\Scripts\python.exe -m quant_alpha.cli paper-eval
 .venv\Scripts\python.exe -m quant_alpha.cli paper-report
 
-# 5. Launch interactive Streamlit dashboard (includes Live Paper Tracker tab)
+# 7. Launch interactive Streamlit dashboard (with Gold/Silver Spotlight & Live Auto-Refresh)
 .venv\Scripts\streamlit.exe run app.py
 ```

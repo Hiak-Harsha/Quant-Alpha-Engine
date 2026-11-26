@@ -291,11 +291,38 @@ def test_paper_ledger_short_take_profit_and_flat(tmp_path) -> None:
 def test_trending_symbol_filter_and_universes() -> None:
     from quant_alpha.config import UNIVERSES
     from quant_alpha.data.trending_feed import _is_tradable_symbol
+    from quant_alpha.features.cross_asset import build_cross_asset_features
 
+    assert len(UNIVERSES["india_market_gold_silver"]) >= 45
+    assert "GOLDBEES.NS" in UNIVERSES["india_gold_silver"]
+    assert "SILVERBEES.NS" in UNIVERSES["india_gold_silver"]
     assert len(UNIVERSES["top_talked_leaders"]) >= 40
     assert _is_tradable_symbol("NVDA") is True
     assert _is_tradable_symbol("RELIANCE.NS") is True
     assert _is_tradable_symbol("^NSEI") is True
+    assert _is_tradable_symbol("USDINR=X") is True
+    assert _is_tradable_symbol("GC=F") is True
     assert _is_tradable_symbol("BTC-USD") is True
     assert _is_tradable_symbol("ES=F") is False
     assert _is_tradable_symbol("^GSPC") is False
+
+    # Verify Indian Gold ETF receives lagged global Gold/Silver & USDINR drivers with zero look-ahead
+    gold_df = _synthetic_ohlcv(160, seed=31)
+    ohlcv_map = {
+        "GOLDBEES.NS": gold_df,
+        "GC=F": _synthetic_ohlcv(160, seed=32),
+        "SI=F": _synthetic_ohlcv(160, seed=33),
+        "USDINR=X": _synthetic_ohlcv(160, seed=34),
+        "^NSEI": _synthetic_ohlcv(160, seed=35),
+    }
+    cf1 = build_cross_asset_features("GOLDBEES.NS", gold_df, ohlcv_map)
+    assert "drv_usdinr_ret5" in cf1.columns
+    assert "corr21_gold_fut" in cf1.columns
+
+    # Perturb final bar of USDINR=X; today's GOLDBEES.NS features must remain identical because USDINR=X is lagged by 1 day
+    ohlcv_mod = dict(ohlcv_map)
+    u_mod = ohlcv_map["USDINR=X"].copy()
+    u_mod.iloc[-1, u_mod.columns.get_loc("Close")] *= 1.5
+    ohlcv_mod["USDINR=X"] = u_mod
+    cf2 = build_cross_asset_features("GOLDBEES.NS", gold_df, ohlcv_mod)
+    pd.testing.assert_frame_equal(cf1, cf2)

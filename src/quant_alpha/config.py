@@ -86,8 +86,35 @@ HORIZON_CONFIGS: Dict[str, HorizonConfig] = {
 }
 
 
-# Diversified multi-asset universes
+# Diversified multi-asset universes (India & Precious Metals default)
 UNIVERSES: Dict[str, List[str]] = {
+    "india_market_gold_silver": [
+        # Indian Indices & Broad Market ETFs
+        "^NSEI", "^NSEBANK", "^CNXIT", "NIFTYBEES.NS", "BANKBEES.NS", "JUNIORBEES.NS", "INDA",
+        # Indian Gold & Silver ETFs + Global Bullion Proxies
+        "GOLDBEES.NS", "HDFCGOLD.NS", "GOLDCASE.NS",
+        "SILVERBEES.NS", "SILVER.NS", "SILVERIETF.NS", "HDFCSILVER.NS",
+        "GLD", "SLV", "GC=F", "SI=F",
+        # Top Indian Blue-Chip & High-Attention NSE Shares
+        "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "ICICIBANK.NS", "INFY.NS",
+        "SBIN.NS", "BHARTIARTL.NS", "ITC.NS", "LT.NS", "KOTAKBANK.NS",
+        "AXISBANK.NS", "BAJFINANCE.NS", "JIOFIN.NS", "HINDUNILVR.NS", "TITAN.NS",
+        "MARUTI.NS", "M&M.NS", "TMPV.NS", "SUNPHARMA.NS", "TATASTEEL.NS",
+        "JSWSTEEL.NS", "HINDALCO.NS", "HAL.NS", "BEL.NS", "ADANIENT.NS",
+        "ADANIPORTS.NS", "NTPC.NS", "ONGC.NS", "POWERGRID.NS", "TRENT.NS",
+        "ETERNAL.NS", "HCLTECH.NS", "WIPRO.NS",
+    ],
+    "india_gold_silver": [
+        "GOLDBEES.NS", "HDFCGOLD.NS", "GOLDCASE.NS",
+        "SILVERBEES.NS", "SILVER.NS", "SILVERIETF.NS", "HDFCSILVER.NS",
+        "GLD", "SLV", "GC=F", "SI=F", "USDINR=X",
+    ],
+    "india_equities": [
+        "^NSEI", "^NSEBANK", "^CNXIT", "NIFTYBEES.NS", "BANKBEES.NS",
+        "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "ICICIBANK.NS", "INFY.NS",
+        "SBIN.NS", "BHARTIARTL.NS", "ITC.NS", "LT.NS", "BAJFINANCE.NS",
+        "HAL.NS", "BEL.NS", "TATASTEEL.NS", "MARUTI.NS", "TMPV.NS", "SUNPHARMA.NS",
+    ],
     "top_talked_leaders": [
         # US Mega-Cap Tech, AI & High-Attention Stocks
         "NVDA", "AAPL", "MSFT", "AMZN", "GOOGL", "META", "TSLA",
@@ -97,17 +124,11 @@ UNIVERSES: Dict[str, List[str]] = {
         # Broad Indices, Bonds, Commodities & Crypto
         "SPY", "QQQ", "IWM", "TLT", "GLD", "SLV", "USO", "BTC-USD", "ETH-USD",
         # India / NSE Leaders & Proxies
-        "^NSEI", "^NSEBANK", "INDA", "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "INFY.NS", "ICICIBANK.NS", "BHARTIARTL.NS",
+        "^NSEI", "^NSEBANK", "INDA", "GOLDBEES.NS", "SILVERBEES.NS",
+        "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "INFY.NS", "ICICIBANK.NS", "BHARTIARTL.NS",
     ],
     "stepping_stone": [
-        "SPY",       # US Large Cap (S&P 500)
-        "QQQ",       # US Tech / Growth (NASDAQ-100)
-        "IWM",       # US Small Cap (Russell 2000)
-        "TLT",       # US 20Y+ Treasury Bonds
-        "GLD",       # Gold
-        "USO",       # Crude Oil
-        "INDA",      # India Equities ETF (US-listed macro proxy)
-        "BTC-USD",   # Bitcoin
+        "SPY", "QQQ", "IWM", "TLT", "GLD", "USO", "INDA", "BTC-USD",
     ],
     "us_equities": [
         "SPY", "QQQ", "IWM", "NVDA", "AAPL", "MSFT", "AMZN", "GOOGL", "META", "TSLA",
@@ -116,22 +137,19 @@ UNIVERSES: Dict[str, List[str]] = {
     "us_sectors": [
         "XLK", "XLF", "XLE", "XLV", "XLI", "XLP", "XLY", "XLU",
     ],
-    "india_equities": [
-        "^NSEI", "^NSEBANK", "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "INFY.NS",
-        "ICICIBANK.NS", "BHARTIARTL.NS", "SBIN.NS", "LT.NS",
-    ],
     "diversified_all": [
         "SPY", "QQQ", "IWM", "NVDA", "AAPL", "MSFT", "AMZN", "GOOGL", "META", "TSLA",
         "AMD", "AVGO", "PLTR", "JPM", "XOM", "LLY",
         "XLK", "XLF", "XLE", "XLV",
         "TLT", "GLD", "SLV", "USO",
-        "INDA", "^NSEI", "^NSEBANK", "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "INFY.NS", "ICICIBANK.NS",
+        "INDA", "^NSEI", "^NSEBANK", "GOLDBEES.NS", "SILVERBEES.NS",
+        "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "INFY.NS", "ICICIBANK.NS",
         "BTC-USD", "ETH-USD",
     ],
 }
 
 
-# Global correlation, volatility, yield, credit, and currency drivers always fetched for context
+# Global correlation, volatility, yield, credit, commodity, FX, and India drivers
 GLOBAL_DRIVERS: List[str] = [
     "SPY",
     "QQQ",
@@ -141,10 +159,15 @@ GLOBAL_DRIVERS: List[str] = [
     "^TNX",
     "^IRX",
     "UUP",
+    "USDINR=X",
     "HYG",
     "IEF",
     "TLT",
     "GLD",
+    "SLV",
+    "GC=F",
+    "SI=F",
+    "BZ=F",
     "USO",
     "XLK",
     "XLF",
@@ -154,6 +177,8 @@ GLOBAL_DRIVERS: List[str] = [
     "XLU",
     "INDA",
     "^NSEI",
+    "^NSEBANK",
+    "^INDIAVIX",
     "BTC-USD",
 ]
 
@@ -168,13 +193,15 @@ FRED_SERIES: Dict[str, str] = {
 }
 
 
-# Public financial & macro RSS feeds
+# Public financial & macro RSS feeds (India + Gold/Silver + Global)
 RSS_FEEDS: Dict[str, str] = {
-    "reuters_business_google": "https://news.google.com/rss/search?q=stock+market+OR+federal+reserve+OR+inflation+when:3d&hl=en-US&gl=US&ceid=US:en",
+    "economic_times_markets": "https://economictimes.indiatimes.com/markets/rssfeeds/1977021501.cms",
+    "economic_times_stocks": "https://economictimes.indiatimes.com/markets/stocks/rssfeeds/2146842.cms",
+    "google_news_india_markets": "https://news.google.com/rss/search?q=(Nifty+OR+Sensex+OR+NSE+OR+RBI+OR+%22gold+etf%22+OR+%22silver+etf%22+OR+goldbees+OR+silverbees+OR+%22Indian+stocks%22)+when:3d&hl=en-IN&gl=IN&ceid=IN:en",
+    "reuters_business_google": "https://news.google.com/rss/search?q=stock+market+OR+gold+price+OR+silver+price+OR+federal+reserve+when:3d&hl=en-US&gl=US&ceid=US:en",
     "marketwatch_top": "https://feeds.content.dowjones.io/public/rss/mw_topstories",
     "cnbc_markets": "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=10000664",
     "investing_news": "https://www.investing.com/rss/news.rss",
-    "economic_times_markets": "https://economictimes.indiatimes.com/markets/rssfeeds/1977021501.cms",
     "sec_edgar_8k": "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=8-K&company=&dateb=&owner=include&start=0&count=40&output=atom",
 }
 
@@ -213,7 +240,7 @@ def ensure_directories() -> None:
 def is_asia_india_ticker(ticker: str) -> bool:
     """Return True if ticker trades in Indian/Asian session prior to US close."""
     upper = ticker.upper()
-    return upper.endswith((".NS", ".BO")) or upper in {"^NSEI", "^NSEBANK", "^INDIAVIX"}
+    return upper.endswith((".NS", ".BO")) or upper in {"^NSEI", "^NSEBANK", "^INDIAVIX", "^CNXIT"}
 
 
 def is_crypto_ticker(ticker: str) -> bool:

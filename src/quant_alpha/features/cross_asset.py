@@ -88,14 +88,21 @@ def build_cross_asset_features(
         "tnx": "^TNX",
         "irx": "^IRX",
         "uup": "UUP",
+        "usdinr": "USDINR=X",
         "hyg": "HYG",
         "ief": "IEF",
         "tlt": "TLT",
         "gld": "GLD",
+        "slv": "SLV",
+        "gold_fut": "GC=F",
+        "silver_fut": "SI=F",
+        "brent": "BZ=F",
         "uso": "USO",
         "xlk": "XLK",
         "xlp": "XLP",
         "nsei": "^NSEI",
+        "nsebank": "^NSEBANK",
+        "indiavix": "^INDIAVIX",
         "btc": "BTC-USD",
     }
 
@@ -110,7 +117,7 @@ def build_cross_asset_features(
             aligned_closes[alias] = aligned["Close"].astype(float)
 
     # Driver momentum & rolling correlation / beta to target
-    corr_drivers = ["spy", "qqq", "vix", "tlt", "gld", "uup", "btc", "nsei"]
+    corr_drivers = ["spy", "qqq", "vix", "tlt", "gld", "slv", "uup", "usdinr", "gold_fut", "silver_fut", "brent", "btc", "nsei"]
     for alias in corr_drivers:
         if alias not in aligned_closes:
             continue
@@ -119,7 +126,7 @@ def build_cross_asset_features(
         d_ret5 = dc.pct_change(5)
         d_ret21 = dc.pct_change(21)
 
-        if alias in {"spy", "qqq", "tlt", "gld", "uup", "btc", "nsei"}:
+        if alias in {"spy", "qqq", "tlt", "gld", "slv", "uup", "usdinr", "gold_fut", "silver_fut", "brent", "btc", "nsei"}:
             feat[f"drv_{alias}_ret1"] = d_ret1
             feat[f"drv_{alias}_ret5"] = d_ret5
             feat[f"drv_{alias}_ret21"] = d_ret21
@@ -132,8 +139,11 @@ def build_cross_asset_features(
             feat[f"corr21_{alias}"] = 1.0
             feat[f"corr63_{alias}"] = 1.0
 
-    # Market Beta & Idiosyncratic Alpha vs SPY (or NSEI if India target and SPY absent)
-    bench_alias = "spy" if "spy" in aligned_closes else ("nsei" if "nsei" in aligned_closes else None)
+    # Market Beta & Idiosyncratic Alpha (use NIFTY 50 for Indian assets when present, SPY otherwise)
+    if target_is_asia and "nsei" in aligned_closes:
+        bench_alias = "nsei"
+    else:
+        bench_alias = "spy" if "spy" in aligned_closes else ("nsei" if "nsei" in aligned_closes else None)
     if bench_alias is not None:
         b_ret1 = aligned_closes[bench_alias].pct_change(1)
         cov63 = target_ret1.rolling(63, min_periods=20).cov(b_ret1)
@@ -151,6 +161,8 @@ def build_cross_asset_features(
         ("hyg_ief", "hyg", "ief"),
         ("xlk_xlp", "xlk", "xlp"),
         ("gld_spy", "gld", "spy"),
+        ("gold_silver", "gld", "slv"),
+        ("nsebank_nsei", "nsebank", "nsei"),
     ]
     for rname, num, den in ratio_pairs:
         if num in aligned_closes and den in aligned_closes:
@@ -192,6 +204,7 @@ def build_cross_asset_features(
                 feat[f"fred_{col.lower()}_chg21"] = s_chg
 
     # Composite Macro Risk-On Score in [-1, +1]
+    feat = feat.copy()
     risk_components = []
     if "ratio_hyg_ief_ret21" in feat.columns:
         risk_components.append(np.tanh(feat["ratio_hyg_ief_ret21"].fillna(0.0) * 35.0))

@@ -6,6 +6,7 @@ import argparse
 import json
 import logging
 import sys
+import time
 from typing import List
 
 import pandas as pd
@@ -227,17 +228,90 @@ def cmd_scan(horizon: str, universe: str, include_trending: bool, max_trending: 
         max_trending_extras=max_trending,
         use_cache=not refresh,
     )
-    print(f"\n=== ACTIVE TOP & TRENDING STOCK PREDICTIONS ({horizon.upper()} | {len(out.scan_df)} ASSETS) ===")
+    print(f"\n=== ACTIVE MARKET & PRECIOUS METALS PREDICTIONS ({horizon.upper()} | {len(out.scan_df)} ASSETS) ===")
     if not out.scan_df.empty:
+        metals = out.scan_df[out.scan_df["market"] == "Gold / Silver ETF"]
+        if not metals.empty:
+            m_cols = [
+                "ticker", "close", "chg_1_pct", "verdict", "composite_ret_pct",
+                "prob_up_pct", "consensus_pct", "garch_vol_pct", "alloc_pct", "stop_loss", "take_profit",
+            ]
+            print("\n--- GOLD & SILVER ETFs SPOTLIGHT ---")
+            print(metals[m_cols].to_string(index=False))
+
         cols = [
-            "ticker", "market", "buzz_score", "news_mentions", "close",
+            "ticker", "market", "buzz_score", "news_mentions", "close", "chg_1_pct",
             "verdict", "composite_ret_pct", "prob_up_pct", "consensus_pct",
             "garch_vol_pct", "alloc_pct", "stop_loss", "take_profit",
         ]
+        print("\n--- FULL UNIVERSE RANKED SIGNALS ---")
         print(out.scan_df[cols].to_string(index=False))
         out.scan_df.to_csv(REPORTS_DIR / f"market_scan_{horizon}.csv", index=False)
     if out.skipped_tickers:
         print(f"\nSkipped ({len(out.skipped_tickers)} tickers lacking history):", out.skipped_tickers)
+    return 0
+
+
+def cmd_monitor(
+    horizon: str,
+    universe: str,
+    interval_sec: int,
+    auto_log: bool,
+    cycles: int,
+) -> int:
+    """Continuous real-time monitor for Indian shares, Gold/Silver ETFs, and paper trades."""
+    ensure_directories()
+    ledger = PaperLedger()
+    cycle_idx = 0
+    while True:
+        cycle_idx += 1
+        now_ist = pd.Timestamp.now(tz="Asia/Kolkata")
+        is_weekday = now_ist.day_of_week < 5
+        in_hours = (now_ist.hour > 9 or (now_ist.hour == 9 and now_ist.minute >= 15)) and (
+            now_ist.hour < 15 or (now_ist.hour == 15 and now_ist.minute <= 30)
+        )
+        nse_state = "NSE OPEN (09:15-15:30 IST)" if (is_weekday and in_hours) else "NSE CLOSED / AFTER-HOURS"
+        print(f"\n==================== LIVE MONITOR CYCLE {cycle_idx} | {now_ist.strftime('%Y-%m-%d %H:%M:%S IST')} | {nse_state} ====================")
+
+        ev = ledger.evaluate_open_predictions()
+        print(f"Paper Eval -> Checked: {ev.checked_open} | Newly Matured: {ev.newly_matured} | Still Open: {ev.still_open}")
+
+        out = scan_market_predictions(
+            horizon_name=horizon,
+            universe_name=universe,
+            include_trending=True,
+            max_trending_extras=10,
+            use_cache=False,
+        )
+        if not out.scan_df.empty:
+            metals = out.scan_df[out.scan_df["market"] == "Gold / Silver ETF"]
+            if not metals.empty:
+                print("\n[Gold & Silver ETFs]")
+                print(
+                    metals[["ticker", "close", "chg_1_pct", "verdict", "composite_ret_pct", "consensus_pct", "alloc_pct", "stop_loss", "take_profit"]]
+                    .to_string(index=False)
+                )
+            top_act = out.scan_df[out.scan_df["verdict"] != "NEUTRAL / HOLD"].head(15)
+            if not top_act.empty:
+                print("\n[Top Actionable Signals]")
+                print(
+                    top_act[["ticker", "market", "close", "chg_1_pct", "verdict", "composite_ret_pct", "prob_up_pct", "consensus_pct", "alloc_pct"]]
+                    .to_string(index=False)
+                )
+            if auto_log and not top_act.empty:
+                events = log_paper_signals(
+                    tickers=top_act["ticker"].head(12).tolist(),
+                    horizons=[horizon],
+                    universe_name=universe,
+                    use_cache=True,
+                    ledger=ledger,
+                )
+                logged_new = sum(1 for e in events if e.get("logged"))
+                print(f"Auto-Logged New Closed-Bar Signals: {logged_new}")
+
+        if cycles > 0 and cycle_idx >= cycles:
+            break
+        time.sleep(max(15, interval_sec))
     return 0
 
 
@@ -247,31 +321,38 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_val = sub.add_parser("validate-feeds", help="Fetch and validate all OHLCV, macro, and news feeds.")
     p_val.add_argument("--horizon", choices=list(HORIZON_CONFIGS.keys()), default="swing")
-    p_val.add_argument("--universe", choices=list(UNIVERSES.keys()), default="top_talked_leaders")
+    p_val.add_argument("--universe", choices=list(UNIVERSES.keys()), default="india_market_gold_silver")
     p_val.add_argument("--refresh", action="store_true")
 
     p_tr = sub.add_parser("train-backtest", help="Run purged walk-forward training, Optuna tuning, and backtest.")
     p_tr.add_argument("--horizon", choices=list(HORIZON_CONFIGS.keys()), default="swing")
-    p_tr.add_argument("--universe", choices=list(UNIVERSES.keys()), default="top_talked_leaders")
+    p_tr.add_argument("--universe", choices=list(UNIVERSES.keys()), default="india_market_gold_silver")
     p_tr.add_argument("--no-tune", action="store_true")
     p_tr.add_argument("--trials", type=int, default=12)
     p_tr.add_argument("--refresh", action="store_true")
 
     p_pr = sub.add_parser("predict", help="Generate multi-model objective prediction for a ticker.")
-    p_pr.add_argument("--ticker", type=str, default="NVDA")
+    p_pr.add_argument("--ticker", type=str, default="^NSEI")
     p_pr.add_argument("--horizon", choices=list(HORIZON_CONFIGS.keys()), default="swing")
-    p_pr.add_argument("--universe", choices=list(UNIVERSES.keys()), default="top_talked_leaders")
+    p_pr.add_argument("--universe", choices=list(UNIVERSES.keys()), default="india_market_gold_silver")
     p_pr.add_argument("--all-horizons", action="store_true")
 
-    p_sc = sub.add_parser("scan", help="Scan & rank active predictions across top & trending stocks.")
+    p_sc = sub.add_parser("scan", help="Scan & rank active predictions across Indian shares, Gold/Silver ETFs & trending.")
     p_sc.add_argument("--horizon", choices=list(HORIZON_CONFIGS.keys()), default="swing")
-    p_sc.add_argument("--universe", choices=list(UNIVERSES.keys()), default="top_talked_leaders")
+    p_sc.add_argument("--universe", choices=list(UNIVERSES.keys()), default="india_market_gold_silver")
     p_sc.add_argument("--no-trending", action="store_true")
-    p_sc.add_argument("--max-trending", type=int, default=15)
+    p_sc.add_argument("--max-trending", type=int, default=12)
     p_sc.add_argument("--refresh", action="store_true")
 
+    p_mon = sub.add_parser("monitor", help="Live monitoring loop for Indian market, Gold/Silver ETFs, and paper ledger.")
+    p_mon.add_argument("--horizon", choices=list(HORIZON_CONFIGS.keys()), default="intraday")
+    p_mon.add_argument("--universe", choices=list(UNIVERSES.keys()), default="india_market_gold_silver")
+    p_mon.add_argument("--interval-sec", type=int, default=180)
+    p_mon.add_argument("--auto-log", action="store_true")
+    p_mon.add_argument("--cycles", type=int, default=0, help="Number of cycles (0 = run continuously).")
+
     p_plog = sub.add_parser("paper-log", help="Log live closed-bar predictions into the forward paper ledger.")
-    p_plog.add_argument("--universe", choices=list(UNIVERSES.keys()), default="top_talked_leaders")
+    p_plog.add_argument("--universe", choices=list(UNIVERSES.keys()), default="india_market_gold_silver")
     p_plog.add_argument("--horizons", type=str, default="swing,intraday")
     p_plog.add_argument("--ticker", type=str, default=None)
     p_plog.add_argument("--refresh", action="store_true")
@@ -293,6 +374,8 @@ def main(argv: List[str] | None = None) -> int:
         return cmd_predict(args.ticker, args.horizon, args.universe, args.all_horizons)
     if args.command == "scan":
         return cmd_scan(args.horizon, args.universe, not args.no_trending, args.max_trending, args.refresh)
+    if args.command == "monitor":
+        return cmd_monitor(args.horizon, args.universe, args.interval_sec, args.auto_log, args.cycles)
     if args.command == "paper-log":
         return cmd_paper_log(args.universe, args.horizons, args.ticker, args.refresh)
     if args.command == "paper-eval":

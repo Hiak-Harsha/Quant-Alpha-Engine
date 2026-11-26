@@ -17,14 +17,15 @@ from quant_alpha.config import DATA_CACHE_DIR, EngineSettings, ensure_directorie
 logger = logging.getLogger(__name__)
 
 _HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-_SKIP_SYMBOLS = {"^GSPC", "^DJI", "^IXIC", "^VIX", "^VXN", "^TNX", "^IRX"}
+_SKIP_SYMBOLS = {"^GSPC", "^DJI", "^IXIC", "^VIX", "^VXN", "^TNX", "^IRX", "^INDIAVIX"}
 
 
-def _trending_cache_path() -> Path:
+def _trending_cache_path(india_focus: bool = False) -> Path:
     ensure_directories()
     folder = DATA_CACHE_DIR / "trending"
     folder.mkdir(parents=True, exist_ok=True)
-    return folder / "trending_stocks.parquet"
+    suffix = "india" if india_focus else "global"
+    return folder / f"trending_stocks_{suffix}.parquet"
 
 
 def _fetch_yf_trending_region(region: str = "US", count: int = 20) -> List[str]:
@@ -57,10 +58,12 @@ def _fetch_yf_screener(query_name: str, count: int = 15) -> List[Dict[str, str]]
 def _is_tradable_symbol(sym: str) -> bool:
     if not sym or sym in _SKIP_SYMBOLS:
         return False
-    # Exclude futures/options/warrants noise while preserving equities, ETFs, .NS/.BO, and -USD crypto
+    # Exclude futures/options/warrants noise while preserving equities, ETFs, .NS/.BO, COMEX gold/silver, FX & -USD crypto
+    if sym in {"GC=F", "SI=F", "BZ=F", "USDINR=X"}:
+        return True
     if "=" in sym or sym.startswith("^"):
-        return sym in {"^NSEI", "^NSEBANK"}
-    return bool(re.match(r"^[A-Z0-9.\-]{1,16}$", sym))
+        return sym in {"^NSEI", "^NSEBANK", "^CNXIT"}
+    return bool(re.match(r"^[A-Z0-9.\-&]{1,18}$", sym))
 
 
 def discover_trending_stocks(
@@ -68,6 +71,7 @@ def discover_trending_stocks(
     candidate_tickers: Optional[List[str]] = None,
     use_cache: bool = True,
     settings: Optional[EngineSettings] = None,
+    india_focus: bool = True,
 ) -> pd.DataFrame:
     """Discover currently trending, most-active, big-mover, and news-buzzed tickers.
 
@@ -75,7 +79,7 @@ def discover_trending_stocks(
     [symbol, name, buzz_score, news_mentions, sources].
     """
     settings = settings or EngineSettings()
-    cpath = _trending_cache_path()
+    cpath = _trending_cache_path(india_focus=india_focus)
 
     if use_cache and cpath.exists():
         age_hours = (time.time() - cpath.stat().st_mtime) / 3600.0
@@ -101,20 +105,22 @@ def discover_trending_stocks(
         entry["buzz_score"] += weight
         entry["sources"].add(source_tag)
 
-    for rank, sym in enumerate(_fetch_yf_trending_region("US", 20)):
-        _add(sym, "YF Trending US", max(1.0, 3.0 - rank * 0.1))
+    for rank, sym in enumerate(_fetch_yf_trending_region("IN", 20)):
+        boost = 1.5 if (india_focus and (sym.endswith((".NS", ".BO")) or sym.startswith("^NSE"))) else 1.0
+        _add(sym, "YF Trending India", max(1.0, (3.2 - rank * 0.1) * boost))
 
-    for rank, sym in enumerate(_fetch_yf_trending_region("IN", 12)):
-        _add(sym, "YF Trending India", max(1.0, 2.5 - rank * 0.1))
+    if not india_focus:
+        for rank, sym in enumerate(_fetch_yf_trending_region("US", 20)):
+            _add(sym, "YF Trending US", max(1.0, 3.0 - rank * 0.1))
 
-    for qname, tag, base_w in (
-        ("most_actives", "Most Active", 2.5),
-        ("day_gainers", "Top Gainer", 2.0),
-        ("day_losers", "Top Mover (Down)", 2.0),
-        ("growth_technology_stocks", "Tech Growth", 1.5),
-    ):
-        for rank, item in enumerate(_fetch_yf_screener(qname, count=15)):
-            _add(item["symbol"], tag, max(0.8, base_w - rank * 0.08), name=item["name"])
+        for qname, tag, base_w in (
+            ("most_actives", "Most Active", 2.5),
+            ("day_gainers", "Top Gainer", 2.0),
+            ("day_losers", "Top Mover (Down)", 2.0),
+            ("growth_technology_stocks", "Tech Growth", 1.5),
+        ):
+            for rank, item in enumerate(_fetch_yf_screener(qname, count=15)):
+                _add(item["symbol"], tag, max(0.8, base_w - rank * 0.08), name=item["name"])
 
     # Score live news headline buzz against candidate & discovered tickers
     if news_df is not None and not news_df.empty:

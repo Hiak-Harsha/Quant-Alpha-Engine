@@ -47,7 +47,7 @@ st.set_page_config(
 )
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
+@st.cache_data(ttl=900, show_spinner=False)
 def _cached_market_bundle(
     universe_name: str,
     horizon_name: str,
@@ -57,15 +57,25 @@ def _cached_market_bundle(
 ) -> tuple[dict, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     hcfg = HORIZON_CONFIGS[horizon_name]
     base_tickers = list(UNIVERSES[universe_name])
+    india_focus = universe_name.startswith("india_")
     macro_df = load_all_macro_series()
-    news_tickers = list(dict.fromkeys(base_tickers[:30] + ([extra_ticker] if extra_ticker else [])))
+    news_tickers = list(dict.fromkeys(base_tickers[:35] + ([extra_ticker] if extra_ticker else [])))
     news_df = score_news_dataframe(fetch_all_news(news_tickers))
-    trending_df = discover_trending_stocks(news_df=news_df, candidate_tickers=base_tickers)
+    trending_df = discover_trending_stocks(
+        news_df=news_df,
+        candidate_tickers=base_tickers,
+        india_focus=india_focus,
+    )
 
     scan_tickers = list(base_tickers)
     if include_trending and not trending_df.empty:
-        extras = [s for s in trending_df["symbol"].tolist() if s not in scan_tickers][:max_trending]
-        scan_tickers.extend(extras)
+        cands = [s for s in trending_df["symbol"].tolist() if s not in scan_tickers]
+        if india_focus:
+            cands = [
+                s for s in cands
+                if s.endswith((".NS", ".BO")) or s in {"GOLDBEES.NS", "SILVERBEES.NS", "GC=F", "SI=F", "GLD", "SLV", "USDINR=X", "^NSEI", "^NSEBANK"}
+            ]
+        scan_tickers.extend(cands[:max_trending])
 
     tickers = list(dict.fromkeys(scan_tickers + GLOBAL_DRIVERS + ([extra_ticker] if extra_ticker else [])))
     ohlcv_map, _ = fetch_universe_ohlcv(tickers, period=hcfg.period, interval=hcfg.interval, max_workers=10)
@@ -126,12 +136,22 @@ def _cached_backtest(horizon_name: str, _oof_df: pd.DataFrame, model_names: tupl
     return bt.leaderboard, bt.equity_curves, bt.drawdown_curves, bt.per_asset_summary
 
 
+def _nse_market_status_str() -> str:
+    now_ist = pd.Timestamp.now(tz="Asia/Kolkata")
+    is_weekday = now_ist.day_of_week < 5
+    in_hours = (now_ist.hour > 9 or (now_ist.hour == 9 and now_ist.minute >= 15)) and (
+        now_ist.hour < 15 or (now_ist.hour == 15 and now_ist.minute <= 30)
+    )
+    status = "NSE OPEN (09:15–15:30 IST)" if (is_weekday and in_hours) else "NSE CLOSED / AFTER-HOURS"
+    return f"{now_ist.strftime('%Y-%m-%d %H:%M:%S IST')} | {status}"
+
+
 def main() -> None:
     ensure_directories()
-    st.title("Quant Alpha Engine — Multi-Asset, Multi-Horizon Prediction System")
+    st.title("Quant Alpha Engine — India Market, Gold/Silver ETFs & Live Monitor")
     st.caption(
-        "Combines LightGBM, XGBoost, ExtraTrees, Regularized Ridge/Logistic, Neural MLP, Classical Quant Signals, "
-        "Causal GARCH(1,1) Volatility, Gaussian HMM Regimes, Cross-Asset Correlations, FRED Macro & Live Financial News NLP."
+        f"{_nse_market_status_str()} • Combines LightGBM, XGBoost, ExtraTrees, Regularized Ridge/Logistic, Neural MLP, "
+        "Classical Quant Signals, GARCH(1,1) Vol, Gaussian HMM Regimes, USD/INR, COMEX Gold/Silver, & Indian/Global News NLP."
     )
 
     with st.sidebar:
@@ -143,16 +163,41 @@ def main() -> None:
             index=1,
             format_func=lambda k: HORIZON_CONFIGS[k].display_name,
         )
-        include_trending = st.checkbox("Auto-Discover Live Trending & Most-Active Stocks", value=True)
-        max_trending = st.slider("Extra Trending Stocks to Scan", min_value=0, max_value=25, value=15)
+        st.divider()
+        st.subheader("Live Monitor Controls")
+        auto_refresh = st.toggle("Enable Auto-Refresh Live Monitor", value=False)
+        refresh_secs = st.selectbox("Refresh Interval", [60, 180, 300], index=1, format_func=lambda s: f"{s} sec")
+        if st.button("Refresh Live Quotes & News Now", width="stretch"):
+            _cached_market_bundle.clear()
+            _cached_market_scan.clear()
+            st.rerun()
+
+        st.divider()
+        include_trending = st.checkbox("Auto-Discover Trending & Buzzed Tickers", value=True)
+        max_trending = st.slider("Extra Trending Stocks to Scan", min_value=0, max_value=20, value=10)
         default_tickers = UNIVERSES[universe_name]
         selected_ticker = st.selectbox("Single-Asset Deep Dive", default_tickers, index=0)
-        custom_ticker = st.text_input("Or Custom Ticker (Yahoo symbol)", value="").strip().upper()
+        custom_ticker = st.text_input("Or Custom Ticker (e.g., TATAPOWER.NS, GOLDBEES.NS)", value="").strip().upper()
         ticker = custom_ticker or selected_ticker
 
         run_all_horizons = st.checkbox("Compute All-Horizons Consensus (Intraday + Swing + Long-Term)", value=False)
-        tune_trials = st.slider("Optuna Tuning Trials (when retraining)", min_value=5, max_value=30, value=12)
+        tune_trials = st.slider("Optuna Tuning Trials (when retraining)", min_value=5, max_value=30, value=10)
         retrain_clicked = st.button("Train / Retune Active Horizon", type="primary")
+
+    if auto_refresh:
+        if "_monitor_tick" not in st.session_state:
+            st.session_state["_monitor_tick"] = 0
+
+        @st.fragment(run_every=refresh_secs)
+        def _live_monitor_heartbeat() -> None:
+            st.session_state["_monitor_tick"] += 1
+            if st.session_state["_monitor_tick"] > 1:
+                _cached_market_bundle.clear()
+                _cached_market_scan.clear()
+                st.rerun()
+            st.caption(f"Auto-refresh active every {refresh_secs}s • Last checked: {_nse_market_status_str()}")
+
+        _live_monitor_heartbeat()
 
     settings = EngineSettings(n_optuna_trials=tune_trials)
 
@@ -186,7 +231,7 @@ def main() -> None:
 
     tabs = st.tabs(
         [
-            "Active Top-Stocks Scanner",
+            "India & Metals Live Scanner",
             "Single-Asset Deep Dive",
             "Walk-Forward Backtest & Leaderboard",
             "Cross-Asset Correlation & Volatility",
@@ -197,7 +242,20 @@ def main() -> None:
 
     # ------------------------------------------------------------------ TAB 1: SCANNER
     with tabs[0]:
-        st.subheader(f"Active Multi-Model Predictions: Top & Most Talked-About Stocks ({HORIZON_CONFIGS[horizon_name].display_name})")
+        st.subheader(f"Live Signals: Indian Shares, Gold & Silver ETFs ({HORIZON_CONFIGS[horizon_name].display_name})")
+
+        # Live Market & Precious Metals Pulse Bar
+        pulse_tickers = ["^NSEI", "^NSEBANK", "^INDIAVIX", "USDINR=X", "GOLDBEES.NS", "SILVERBEES.NS"]
+        p_cols = st.columns(len(pulse_tickers))
+        for idx_p, pt in enumerate(pulse_tickers):
+            pdf = ohlcv_map.get(pt)
+            if pdf is not None and len(pdf) >= 2:
+                last_v = float(pdf["Close"].iloc[-1])
+                chg_v = float(pdf["Close"].pct_change(1).iloc[-1] * 100.0)
+                p_cols[idx_p].metric(pt, f"{last_v:,.2f}", f"{chg_v:+.2f}%")
+            else:
+                p_cols[idx_p].metric(pt, "N/A")
+
         scan_df, skipped_map = _cached_market_scan(
             horizon_name,
             universe_name,
@@ -211,17 +269,27 @@ def main() -> None:
         if scan_df.empty:
             st.warning("No predictions generated across scanned tickers.")
         else:
+            metals_df = scan_df[scan_df["market"] == "Gold / Silver ETF"].copy()
+            if not metals_df.empty:
+                st.markdown("### Gold & Silver ETFs + Bullion Spotlight")
+                metal_cols = [
+                    "ticker", "close", "chg_1_pct", "verdict", "composite_ret_pct",
+                    "prob_up_pct", "consensus_pct", "garch_vol_pct", "regime",
+                    "alloc_pct", "stop_loss", "take_profit",
+                ]
+                st.dataframe(metals_df[metal_cols], width="stretch", hide_index=True)
+
             bull_n = int(scan_df["verdict"].str.contains("BULLISH").sum())
             bear_n = int(scan_df["verdict"].str.contains("BEARISH").sum())
             neut_n = int((scan_df["verdict"] == "NEUTRAL / HOLD").sum())
             trend_n = int((scan_df["buzz_score"] > 0).sum())
 
             s1, s2, s3, s4, s5 = st.columns(5)
-            s1.metric("Stocks Predicted", len(scan_df), f"Skipped: {len(skipped_map)}")
-            s2.metric("Bullish Calls", bull_n)
-            s3.metric("Bearish Calls", bear_n)
+            s1.metric("Assets Predicted", len(scan_df), f"Skipped: {len(skipped_map)}")
+            s2.metric("Bullish Signals", bull_n)
+            s3.metric("Bearish Signals", bear_n)
             s4.metric("Neutral / Below Hurdle", neut_n)
-            s5.metric("Trending / Buzzed", trend_n, f"Sources: {len(trending_df)} total")
+            s5.metric("Buzzed / News Active", trend_n, f"Trending: {len(trending_df)}")
 
             f_col1, f_col2, f_col3 = st.columns([1.2, 1.2, 1.3])
             with f_col1:
@@ -439,9 +507,15 @@ def main() -> None:
     # ------------------------------------------------------------------ TAB 4: CORRELATIONS
     with tabs[3]:
         st.subheader("Cross-Asset Return Correlation Matrix")
-        corr_tickers = [t for t in UNIVERSES[universe_name] + ["^VIX", "UUP", "HYG", "IEF"] if t in ohlcv_map]
+        corr_candidates = list(
+            dict.fromkeys(
+                ["^NSEI", "^NSEBANK", "GOLDBEES.NS", "SILVERBEES.NS", "GLD", "SLV", "USDINR=X", "BZ=F", "^INDIAVIX", "SPY", "^VIX"]
+                + UNIVERSES[universe_name][:12]
+            )
+        )
+        corr_tickers = [t for t in corr_candidates if t in ohlcv_map][:18]
         ret_series = {}
-        for t in dict.fromkeys(corr_tickers):
+        for t in corr_tickers:
             ret_series[t] = ohlcv_map[t]["Close"].pct_change(1)
         corr_df = pd.DataFrame(ret_series).tail(252).corr().round(2)
         if not corr_df.empty:
@@ -451,7 +525,7 @@ def main() -> None:
                 color_continuous_scale="RdBu",
                 zmin=-1,
                 zmax=1,
-                title="Trailing 252-Bar Cross-Asset Return Correlations",
+                title="Trailing 252-Bar Cross-Asset Return Correlations (India, Gold/Silver, FX & Global)",
             )
             st.plotly_chart(fig_corr, width="stretch")
 
@@ -473,9 +547,14 @@ def main() -> None:
                 fig_v = px.line(v_plot, title=f"{ticker} Annualized Volatility: Realized vs Garman-Klass vs GARCH(1,1) (%)")
                 st.plotly_chart(fig_v, width="stretch")
             with col_v2:
-                corr_cols = [c for c in ("corr21_spy", "corr21_tlt", "corr21_gld", "corr21_btc", "corr21_vix") if c in cross_df.columns]
+                corr_cols = [
+                    c for c in (
+                        "corr21_nsei", "corr21_gold_fut", "corr21_silver_fut",
+                        "corr21_usdinr", "corr21_spy", "corr21_vix"
+                    ) if c in cross_df.columns
+                ]
                 if corr_cols:
-                    fig_rc = px.line(cross_df[corr_cols], title=f"{ticker} Rolling 21-Bar Correlations to Global Drivers")
+                    fig_rc = px.line(cross_df[corr_cols], title=f"{ticker} Rolling 21-Bar Correlations (NIFTY, Gold, Silver, USD/INR, SPY)")
                     st.plotly_chart(fig_rc, width="stretch")
 
     # ------------------------------------------------------------------ TAB 5: FEEDS & NEWS
