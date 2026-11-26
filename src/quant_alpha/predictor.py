@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
+import joblib
 import numpy as np
 import pandas as pd
 
@@ -13,6 +15,7 @@ from quant_alpha.backtest.engine import run_backtest_comparison
 from quant_alpha.backtest.metrics import evaluate_asset_pass_gate, evaluate_pass_gate_from_metrics
 from quant_alpha.config import (
     ARTIFACTS_DIR,
+    DATA_CACHE_DIR,
     GLOBAL_DRIVERS,
     HORIZON_CONFIGS,
     UNIVERSES,
@@ -24,6 +27,7 @@ from quant_alpha.data.macro_feed import load_all_macro_series
 from quant_alpha.data.market_feed import fetch_ohlcv, fetch_universe_ohlcv
 from quant_alpha.data.news_feed import fetch_all_news
 from quant_alpha.data.trending_feed import discover_trending_stocks
+from quant_alpha.features.cross_sectional import CROSS_SECTIONAL_FEATURE_COLS, add_cross_sectional_features
 from quant_alpha.features.pipeline import build_asset_feature_frame, build_universe_dataset
 from quant_alpha.features.regime import REGIME_LABELS
 from quant_alpha.features.sentiment import compute_news_sentiment_summary, score_news_dataframe
@@ -223,6 +227,7 @@ def predict_asset(
     closed_bars_only: bool = True,
     compute_shap: bool = True,
     _track_cache: Optional[Tuple[Dict[str, Any], Dict[str, Dict[str, Any]], bool, str]] = None,
+    _live_cs_override: Optional[Dict[str, float]] = None,
 ) -> LivePredictionReport:
     """Generate an objective multi-model, volatility-, regime-, gate-, and constraint-aware forecast."""
     settings = settings or EngineSettings()
@@ -259,10 +264,10 @@ def predict_asset(
     if target_df is None or len(target_df) < 70:
         raise ValueError(f"Insufficient price history for '{ticker}' on {horizon_name} ({horizon_cfg.interval}).")
 
-    if len(target_df) > 360:
-        target_df = target_df.tail(360)
+    if len(target_df) > 3000:
+        target_df = target_df.tail(3000)
     inference_ohlcv_map = {
-        k: (v.tail(450) if len(v) > 450 else v)
+        k: (v.tail(3000) if len(v) > 3000 else v)
         for k, v in ohlcv_map.items()
     }
     inference_ohlcv_map[ticker] = target_df
@@ -287,6 +292,12 @@ def predict_asset(
     regime_detector = bundle["final_regime_detector"]
     regime_df = regime_detector.predict_proba(asset_frame)
     full_frame = pd.concat([asset_frame, regime_df], axis=1)
+
+    for cs_col in CROSS_SECTIONAL_FEATURE_COLS:
+        if _live_cs_override and cs_col in _live_cs_override:
+            full_frame.loc[full_frame.index[-1], cs_col] = _live_cs_override[cs_col]
+        elif cs_col not in full_frame.columns:
+            full_frame[cs_col] = 0.5 if cs_col.startswith("cs_rank_") else 0.0
 
     feature_cols: List[str] = bundle["feature_cols"]
     for col in feature_cols:
@@ -641,6 +652,52 @@ def scan_market_predictions(
     reports: Dict[str, LivePredictionReport] = {}
     skipped: Dict[str, str] = {}
 
+    # Compute live peer cross-sectional ranks across all scanned tickers so live features match training
+    cs_peer_frames: List[pd.DataFrame] = []
+    from quant_alpha.paper.ledger import filter_closed_bars
+
+    for t in scan_tickers:
+        t_df_raw = ohlcv_map.get(t)
+        if t_df_raw is None or t_df_raw.empty:
+            continue
+        t_df_c = filter_closed_bars(t_df_raw, horizon_cfg.interval, t) if closed_bars_only else t_df_raw
+        if len(t_df_c) < 70:
+            continue
+        c_ser = t_df_c["Close"].astype(float)
+        r1 = c_ser.pct_change(1).iloc[-1]
+        r5 = c_ser.pct_change(5).iloc[-1]
+        r21 = c_ser.pct_change(21).iloc[-1]
+        rv21 = float(np.log(c_ser / c_ser.shift(1).replace(0.0, np.nan)).tail(21).std() * np.sqrt(horizon_cfg.bars_per_year))
+        delta = c_ser.diff()
+        up = delta.clip(lower=0.0).ewm(alpha=1 / 14, min_periods=14).mean()
+        dn = (-delta.clip(upper=0.0)).ewm(alpha=1 / 14, min_periods=14).mean()
+        rsi14 = float((100.0 - 100.0 / (1.0 + (up / dn.replace(0.0, np.nan)))).iloc[-1])
+        vol_s = t_df_c["Volume"].astype(float).replace(0.0, np.nan)
+        amihud = float((c_ser.pct_change(1).abs() / (c_ser * vol_s + 1.0)).tail(21).mean())
+        cs_peer_frames.append(
+            pd.DataFrame(
+                {
+                    "Timestamp": [pd.Timestamp("2099-01-01")],
+                    "ticker": [t],
+                    "ret_1": [float(r1) if np.isfinite(r1) else 0.0],
+                    "ret_5": [float(r5) if np.isfinite(r5) else 0.0],
+                    "ret_21": [float(r21) if np.isfinite(r21) else 0.0],
+                    "rv_21": [rv21 if np.isfinite(rv21) else 0.18],
+                    "rsi_14": [rsi14 if np.isfinite(rsi14) else 50.0],
+                    "amihud_21": [amihud if np.isfinite(amihud) else 0.0],
+                    "idio_ret_21": [float(r21) if np.isfinite(r21) else 0.0],
+                }
+            )
+        )
+
+    cs_lookup: Dict[str, Dict[str, float]] = {}
+    if cs_peer_frames:
+        cs_panel = add_cross_sectional_features(pd.concat(cs_peer_frames, ignore_index=True))
+        for _, r_cs in cs_panel.iterrows():
+            cs_lookup[str(r_cs["ticker"])] = {
+                c: float(r_cs[c]) for c in CROSS_SECTIONAL_FEATURE_COLS if c in cs_panel.columns
+            }
+
     for t in scan_tickers:
         try:
             rep = predict_asset(
@@ -656,6 +713,7 @@ def scan_market_predictions(
                 closed_bars_only=closed_bars_only,
                 compute_shap=False,
                 _track_cache=track_cache,
+                _live_cs_override=cs_lookup.get(t),
             )
             reports[t] = rep
         except Exception as exc:
@@ -725,4 +783,48 @@ def scan_market_predictions(
         .drop(columns=["_sort_act", "_sort_conv"])
         .reset_index(drop=True)
     )
-    return MarketScanOutput(scan_df, trending_df, reports, skipped, track_cache[0])
+    out = MarketScanOutput(scan_df, trending_df, reports, skipped, track_cache[0])
+    save_scan_snapshot(horizon_name, universe_name, out)
+    return out
+
+
+def _snapshot_path(horizon_name: str, universe_name: str):
+    snap_dir = DATA_CACHE_DIR / "snapshots"
+    snap_dir.mkdir(parents=True, exist_ok=True)
+    return snap_dir / f"{horizon_name}__{universe_name}.joblib"
+
+
+def save_scan_snapshot(horizon_name: str, universe_name: str, out: MarketScanOutput) -> None:
+    """Persist lightweight live scan output to disk for instant UI startup."""
+    try:
+        payload = {
+            "saved_at": time.time(),
+            "scan_df": out.scan_df,
+            "skipped_tickers": out.skipped_tickers,
+            "horizon_track_record": out.horizon_track_record,
+        }
+        joblib.dump(payload, _snapshot_path(horizon_name, universe_name), compress=3)
+    except Exception:
+        pass
+
+
+def load_scan_snapshot(
+    horizon_name: str,
+    universe_name: str,
+    ttl_hours: float = 6.0,
+) -> Optional[Tuple[pd.DataFrame, Dict[str, str], Dict[str, Any]]]:
+    """Load recent precomputed scan snapshot from disk if within TTL."""
+    path = _snapshot_path(horizon_name, universe_name)
+    if not path.exists():
+        return None
+    if (time.time() - path.stat().st_mtime) / 3600.0 > ttl_hours:
+        return None
+    try:
+        payload = joblib.load(path)
+        return (
+            payload.get("scan_df", pd.DataFrame()),
+            payload.get("skipped_tickers", {}),
+            payload.get("horizon_track_record", {}),
+        )
+    except Exception:
+        return None

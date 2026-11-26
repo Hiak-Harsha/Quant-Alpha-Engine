@@ -1,4 +1,4 @@
-"""Leak-free unsupervised market regime detector (Gaussian HMM with quantile fallback)."""
+"""Causal market-level Hidden Markov Regime detector with forward-only filtering."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ from typing import List, Optional
 
 import numpy as np
 import pandas as pd
+from scipy.special import logsumexp
 from sklearn.preprocessing import StandardScaler
 
 logger = logging.getLogger(__name__)
@@ -20,7 +21,7 @@ REGIME_LABELS = {
 
 
 class MarketRegimeDetector:
-    """Causal 3-state regime detector fit strictly on training folds."""
+    """Causal 3-state regime detector fit on chronological market-level series."""
 
     def __init__(self, n_states: int = 3, random_state: int = 42) -> None:
         self.n_states = n_states
@@ -30,22 +31,66 @@ class MarketRegimeDetector:
         self.state_order_: List[int] = list(range(n_states))
         self.vol_thresholds_: Optional[np.ndarray] = None
         self.used_hmm_: bool = False
+        self.regime_cols_: List[str] = []
 
-    def _select_regime_inputs(self, df: pd.DataFrame) -> np.ndarray:
+    def _select_regime_inputs(self, df: pd.DataFrame) -> pd.DataFrame:
         cols = [c for c in ("ret_5", "rv_21", "vol_ratio_5_21", "vix_level") if c in df.columns]
         if not cols:
-            cols = [c for c in df.columns if c.startswith(("ret_", "rv_"))][:3]
-        sub = df[cols].copy() if cols else pd.DataFrame(np.zeros((len(df), 2)), index=df.index)
-        sub = sub.ffill().bfill().fillna(0.0)
-        return sub.to_numpy(dtype=float)
+            cols = [c for c in df.columns if str(c).startswith(("ret_", "rv_"))][:3]
+        if not cols:
+            return pd.DataFrame(np.zeros((len(df), 2)), index=df.index, columns=["f0", "f1"])
+        self.regime_cols_ = cols
+        sub = df[cols].copy().ffill().bfill().fillna(0.0)
+        return sub
 
-    def fit(self, X_train: pd.DataFrame) -> "MarketRegimeDetector":
-        """Fit HMM or fallback volatility quantiles on training data only."""
-        arr = self._select_regime_inputs(X_train)
-        arr_scaled = self.scaler.fit_transform(arr)
+    def _aggregate_market_series(
+        self,
+        feat_df: pd.DataFrame,
+        timestamps: Optional[pd.Series] = None,
+    ) -> pd.DataFrame:
+        """Collapse panel rows into one chronological market series per unique Timestamp."""
+        if timestamps is None:
+            return feat_df.reset_index(drop=True)
+        ts = pd.to_datetime(timestamps).reset_index(drop=True)
+        tmp = feat_df.reset_index(drop=True).copy()
+        tmp["_ts"] = ts
+        mkt = tmp.groupby("_ts", sort=True).median(numeric_only=True)
+        return mkt
 
-        # Fallback volatility thresholds from training distribution
-        vol_col = X_train["rv_21"] if "rv_21" in X_train.columns else pd.Series(np.zeros(len(X_train)))
+    def _forward_filter_probs(self, arr_scaled: np.ndarray) -> np.ndarray:
+        """Strictly causal HMM forward filter: P(s_t | x_{1:t}) using zero future bars."""
+        model = self.hmm
+        if model is None:
+            raise RuntimeError("HMM model is not initialized.")
+        log_lik = model._compute_log_likelihood(arr_scaled)
+        startprob = np.clip(model.startprob_, 1e-12, 1.0)
+        transmat = np.clip(model.transmat_, 1e-12, 1.0)
+        log_start = np.log(startprob)
+        log_trans = np.log(transmat)
+
+        t_len, n_comp = log_lik.shape
+        probs = np.empty((t_len, n_comp), dtype=float)
+        log_alpha = log_start + log_lik[0]
+        log_alpha -= logsumexp(log_alpha)
+        probs[0] = np.exp(log_alpha)
+
+        for t in range(1, t_len):
+            log_alpha = logsumexp(log_alpha[:, None] + log_trans, axis=0) + log_lik[t]
+            log_alpha -= logsumexp(log_alpha)
+            probs[t] = np.exp(log_alpha)
+        return probs
+
+    def fit(
+        self,
+        X_train: pd.DataFrame,
+        timestamps: Optional[pd.Series] = None,
+    ) -> "MarketRegimeDetector":
+        """Fit HMM on chronological market series from the training fold only."""
+        sub = self._select_regime_inputs(X_train)
+        mkt_series = self._aggregate_market_series(sub, timestamps=timestamps)
+        arr_scaled = self.scaler.fit_transform(mkt_series.to_numpy(dtype=float))
+
+        vol_col = mkt_series["rv_21"] if "rv_21" in mkt_series.columns else pd.Series(np.zeros(len(mkt_series)))
         vol_clean = vol_col.dropna()
         if len(vol_clean) >= 30:
             self.vol_thresholds_ = np.quantile(vol_clean, [0.35, 0.78])
@@ -53,7 +98,7 @@ class MarketRegimeDetector:
             self.vol_thresholds_ = np.array([0.14, 0.25])
 
         self.used_hmm_ = False
-        if len(arr_scaled) >= 120:
+        if len(arr_scaled) >= 80:
             try:
                 from hmmlearn.hmm import GaussianHMM
 
@@ -66,7 +111,6 @@ class MarketRegimeDetector:
                         random_state=self.random_state,
                     )
                     model.fit(arr_scaled)
-                    # Order states from lowest volatility (index 1 in inputs if rv_21 present) to highest
                     vol_idx = 1 if arr_scaled.shape[1] > 1 else 0
                     state_vols = model.means_[:, vol_idx]
                     self.state_order_ = [int(i) for i in np.argsort(state_vols)]
@@ -78,15 +122,38 @@ class MarketRegimeDetector:
 
         return self
 
-    def predict_proba(self, X: pd.DataFrame) -> pd.DataFrame:
-        """Return ordered regime state and state probabilities for rows in X."""
-        arr = self._select_regime_inputs(X)
-        arr_scaled = self.scaler.transform(arr)
+    def predict_proba(
+        self,
+        X: pd.DataFrame,
+        timestamps: Optional[pd.Series] = None,
+    ) -> pd.DataFrame:
+        """Return strictly causal ordered regime state & probabilities aligned to X.index."""
+        sub = self._select_regime_inputs(X)
         n = len(X)
 
         if self.used_hmm_ and self.hmm is not None:
             try:
-                raw_probs = self.hmm.predict_proba(arr_scaled)
+                if timestamps is not None:
+                    ts = pd.to_datetime(timestamps).reset_index(drop=True)
+                    mkt_series = self._aggregate_market_series(sub, timestamps=ts)
+                    arr_scaled = self.scaler.transform(mkt_series.to_numpy(dtype=float))
+                    raw_probs = self._forward_filter_probs(arr_scaled)
+                    ordered = raw_probs[:, self.state_order_]
+                    mkt_out = pd.DataFrame(
+                        {
+                            "regime_state": np.argmax(ordered, axis=1).astype(float),
+                            "prob_regime_bull": ordered[:, 0],
+                            "prob_regime_chop": ordered[:, 1],
+                            "prob_regime_crisis": ordered[:, 2],
+                        },
+                        index=mkt_series.index,
+                    )
+                    mapped = mkt_out.reindex(ts).reset_index(drop=True)
+                    mapped.index = X.index
+                    return mapped
+
+                arr_scaled = self.scaler.transform(sub.to_numpy(dtype=float))
+                raw_probs = self._forward_filter_probs(arr_scaled)
                 ordered_probs = raw_probs[:, self.state_order_]
                 states = np.argmax(ordered_probs, axis=1)
                 return pd.DataFrame(

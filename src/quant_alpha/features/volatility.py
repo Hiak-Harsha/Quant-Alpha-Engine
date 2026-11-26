@@ -2,19 +2,24 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import warnings
+from typing import Dict
 
 import numpy as np
 import pandas as pd
 
+from quant_alpha.config import DATA_CACHE_DIR
+
 logger = logging.getLogger(__name__)
+_VOL_MEM_CACHE: Dict[str, pd.DataFrame] = {}
 
 
 def _rolling_causal_garch(
     returns: pd.Series,
     bars_per_year: int = 252,
-    refit_every: int = 21,
+    refit_every: int = 42,
     min_obs: int = 120,
 ) -> pd.Series:
     """Estimate strictly causal 1-step-ahead GARCH(1,1) annualized volatility.
@@ -81,6 +86,30 @@ def compute_volatility_features(df: pd.DataFrame, bars_per_year: int = 252) -> p
     low = df["Low"].astype(float)
     close = df["Close"].astype(float)
 
+    # Exact content-addressed cache avoids re-fitting GARCH on identical OHLCV histories
+    hasher = hashlib.blake2b(digest_size=12)
+    hasher.update(str(bars_per_year).encode("ascii"))
+    hasher.update(str(len(df)).encode("ascii"))
+    hasher.update(str(df.index[-1]).encode("utf-8"))
+    for s in (open_p, high, low, close):
+        hasher.update(s.to_numpy(dtype=np.float64, copy=False).tobytes())
+    cache_key = hasher.hexdigest()
+
+    if cache_key in _VOL_MEM_CACHE:
+        return _VOL_MEM_CACHE[cache_key].copy()
+
+    vol_cache_dir = DATA_CACHE_DIR / "vol"
+    vol_cache_path = vol_cache_dir / f"{cache_key}.parquet"
+    if vol_cache_path.exists():
+        try:
+            cached = pd.read_parquet(vol_cache_path)
+            if len(cached) == len(df):
+                cached.index = df.index
+                _VOL_MEM_CACHE[cache_key] = cached
+                return cached.copy()
+        except Exception:
+            pass
+
     log_ret = np.log(close / close.shift(1).replace(0.0, np.nan))
     feat = pd.DataFrame(index=df.index)
 
@@ -124,4 +153,11 @@ def compute_volatility_features(df: pd.DataFrame, bars_per_year: int = 252) -> p
     feat["garch_vol_forecast"] = _rolling_causal_garch(log_ret, bars_per_year=bars_per_year)
     feat["garch_vs_rv21"] = feat["garch_vol_forecast"] / feat["rv_21"].replace(0.0, np.nan)
 
-    return feat.replace([np.inf, -np.inf], np.nan)
+    out = feat.replace([np.inf, -np.inf], np.nan)
+    _VOL_MEM_CACHE[cache_key] = out
+    try:
+        vol_cache_dir.mkdir(parents=True, exist_ok=True)
+        out.to_parquet(vol_cache_path)
+    except Exception:
+        pass
+    return out.copy()

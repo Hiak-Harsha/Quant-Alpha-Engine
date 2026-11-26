@@ -613,3 +613,132 @@ def test_next_day_horizon_and_modular_ui_watchlists() -> None:
     assert scen["gated_capital"] == 0.0
 
 
+def test_ist_date_normalization_indian_costs_and_paper_simulator(tmp_path) -> None:
+    from quant_alpha.data.market_feed import _normalize_ohlcv_df
+    from quant_alpha.paper.costs import compute_order_fees, estimate_round_trip_breakeven_pct
+    from quant_alpha.paper.simulator import PaperBrokerSimulator, compute_prediction_market_correlation
+
+    # Verify IST 2026-11-26 midnight bar preserves 2026-11-26 (not UTC-shifted to 2026-11-25)
+    ist_idx = pd.DatetimeIndex(["2026-11-25 00:00:00", "2026-11-26 00:00:00"]).tz_localize("Asia/Kolkata")
+    raw = pd.DataFrame(
+        {"Open": [100.0, 101.0], "High": [102.0, 103.0], "Low": [99.0, 100.0], "Close": [101.0, 102.0], "Volume": [1000, 1200]},
+        index=ist_idx,
+    )
+    norm = _normalize_ohlcv_df(raw, interval="1d")
+    assert list(norm.index.strftime("%Y-%m-%d")) == ["2026-11-25", "2026-11-26"]
+
+    # Verify Indian equity & ETF delivery costs
+    buy_fees = compute_order_fees("RELIANCE.NS", "BUY", 10000.0)
+    sell_fees = compute_order_fees("RELIANCE.NS", "SELL", 10000.0)
+    assert buy_fees["stt"] == 10.0
+    assert buy_fees["stamp_duty"] == 1.5
+    assert buy_fees["dp_charge"] == 0.0
+    assert sell_fees["dp_charge"] == 15.34
+    assert estimate_round_trip_breakeven_pct("GOLDBEES.NS", 10000.0) > 0.15
+
+    # Verify PaperBrokerSimulator cash delivery enforcement & realized P&L
+    db_file = tmp_path / "sim_test.db"
+    sim = PaperBrokerSimulator(db_path=db_file)
+    bad_frac = sim.preview_order("default_student", "RELIANCE.NS", "BUY", 1.5, 1000.0)
+    assert bad_frac.valid is False
+    ok_buy, _ = sim.execute_order("default_student", "RELIANCE.NS", "BUY", 10, 1000.0, signal_verdict="STRONG BULLISH")
+    assert ok_buy is True
+    bad_short = sim.preview_order("default_student", "RELIANCE.NS", "SELL", 15, 1050.0)
+    assert bad_short.valid is False
+
+    ok_sell, _ = sim.execute_order("default_student", "RELIANCE.NS", "SELL", 10, 1100.0)
+    assert ok_sell is True
+    snap = sim.get_portfolio_snapshot("default_student", {"RELIANCE.NS": 1100.0})
+    assert snap["realized_pnl"] > 900.0  # +1000 gross minus real Indian buy+sell fees
+    assert snap["total_fees_paid"] > 30.0
+    assert abs(snap["total_equity"] - (100000.0 + snap["realized_pnl"])) < 0.5
+
+    # Fractional crypto order allowed
+    ok_btc, _ = sim.execute_order("default_student", "BTC-USD", "BUY", 0.05, 90000.0)
+    assert ok_btc is True
+
+    # Prediction vs Market Correlation helper runs cleanly
+    ledger = PaperLedger(db_path=db_file)
+    corr = compute_prediction_market_correlation(ledger)
+    assert corr["n_matured"] == 0
+
+
+def test_causal_market_hmm_cross_sectional_dedup_and_justification() -> None:
+    from quant_alpha.config import HORIZON_CONFIGS
+    from quant_alpha.features.cross_sectional import add_cross_sectional_features, select_canonical_tickers
+    from quant_alpha.features.pipeline import build_universe_dataset
+    from quant_alpha.features.regime import MarketRegimeDetector
+    from quant_alpha.ui.components import build_signal_justification
+
+    # Deduplication keeps 1 Gold, 1 Silver, 1 Nifty, plus individual equities
+    canonical = select_canonical_tickers(
+        ["GOLDBEES.NS", "HDFCGOLD.NS", "GC=F", "GLD", "SILVERBEES.NS", "SLV", "^NSEI", "NIFTYBEES.NS", "RELIANCE.NS"]
+    )
+    assert set(canonical) == {"GOLDBEES.NS", "SILVERBEES.NS", "^NSEI", "RELIANCE.NS"}
+
+    # Chronological HMM forward filter has zero look-ahead when future bars change
+    df1 = _synthetic_ohlcv(220, seed=71)
+    feat1 = compute_volatility_features(df1)
+    feat1["ret_5"] = df1["Close"].pct_change(5).fillna(0.0)
+    feat2 = feat1.copy()
+    feat2.iloc[-5:] *= 4.0
+
+    det = MarketRegimeDetector(random_state=42).fit(feat1.iloc[:150], timestamps=pd.Series(df1.index[:150]))
+    p1 = det.predict_proba(feat1, timestamps=pd.Series(df1.index))
+    p2 = det.predict_proba(feat2, timestamps=pd.Series(df1.index))
+    pd.testing.assert_frame_equal(p1.iloc[:-5], p2.iloc[:-5], atol=1e-10)
+
+    # Cross-sectional features populate cleanly
+    d_a = _synthetic_ohlcv(160, seed=81)
+    d_b = _synthetic_ohlcv(160, seed=82)
+    ds = build_universe_dataset(
+        ["RELIANCE.NS", "TCS.NS", "GOLDBEES.NS", "HDFCGOLD.NS"],
+        {"RELIANCE.NS": d_a, "TCS.NS": d_b, "GOLDBEES.NS": d_a, "HDFCGOLD.NS": d_a, "SPY": d_b},
+        macro_df=None,
+        horizon_cfg=HORIZON_CONFIGS["next_day"],
+    )
+    assert "cs_rank_ret21" in ds.feature_cols
+    assert "HDFCGOLD.NS" not in set(ds.panel_df["ticker"].unique())
+
+    cs_only = add_cross_sectional_features(
+        pd.DataFrame({"Timestamp": [pd.Timestamp("2026-11-26")] * 2, "ticker": ["A", "B"], "ret_1": [0.02, -0.01], "ret_5": [0.05, 0.01], "ret_21": [0.1, -0.02], "rv_21": [0.2, 0.3], "rsi_14": [65.0, 40.0], "amihud_21": [1e-6, 2e-6], "idio_ret_21": [0.04, -0.02]})
+    )
+    assert float(cs_only.loc[0, "cs_rank_ret1"]) > float(cs_only.loc[1, "cs_rank_ret1"])
+
+    rep = LivePredictionReport(
+        ticker="RELIANCE.NS",
+        horizon_name="next_day",
+        horizon_display="Next Day",
+        as_of_timestamp="2026-11-26",
+        last_close=1396.2,
+        verdict="NO EDGE / GATED",
+        quant_expected_ret_pct=0.25,
+        composite_expected_ret_pct=0.22,
+        expected_range_low_pct=-1.1,
+        expected_range_high_pct=1.54,
+        prob_up_pct=56.0,
+        model_agreement_pct=83.3,
+        model_disagreement_std=0.1,
+        cost_hurdle_pct=0.1,
+        suggested_allocation_pct=0.0,
+        stop_loss_price=1350.0,
+        take_profit_price=1450.0,
+        garch_ann_vol_pct=24.0,
+        realized_vol21_pct=22.0,
+        vix_level=16.8,
+        regime_label="Low-Vol Bull / Calm",
+        regime_probs={"Low-Vol Bull": 72.0},
+        news_summary={"asset_article_count": 3, "macro_article_count": 2, "composite_sentiment": 0.2},
+        model_breakdown=[],
+        top_drivers=[{"feature": "cs_rank_ret21", "value": 0.85, "shap_impact": 0.12, "direction": "Bullish"}],
+        cross_asset_snapshot={"beta_market_63": 1.05},
+        gate_passed=False,
+        gate_reason="Horizon gated",
+        raw_verdict="LEAN BULLISH",
+    )
+    cards = build_signal_justification(rep, position_capital=100000.0)
+    assert len(cards) == 5
+    assert "21D Peer Momentum Rank" in cards[0]["body"]
+
+
+

@@ -1,21 +1,72 @@
-"""Modular, plain-English data formatters and watchlists for Quant Alpha Engine UI."""
+"""Modular, plain-English data formatters, justification engine, and watchlists."""
 
 from __future__ import annotations
 
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, List, Tuple
 
 import pandas as pd
 
+from quant_alpha.paper.costs import DEFAULT_FEE_SCHEDULE, estimate_round_trip_breakeven_pct
+from quant_alpha.portfolio.construct import is_cash_long_only_asset
 from quant_alpha.predictor import LivePredictionReport
+
+_FEATURE_LABELS: Dict[str, str] = {
+    "ret_1": "1-Bar Return",
+    "ret_2": "2-Bar Return",
+    "ret_3": "3-Bar Return",
+    "ret_5": "5-Bar Return",
+    "ret_10": "10-Bar Return",
+    "ret_21": "21-Bar Momentum",
+    "ret_63": "63-Bar Trend",
+    "rsi_14": "14-Bar RSI",
+    "macd_hist": "MACD Histogram",
+    "bb_zscore_20": "Bollinger 20D Z-Score",
+    "atr_14_pct": "14D ATR %",
+    "adx_14": "14D ADX Trend Strength",
+    "rv_5": "5D Realized Vol",
+    "rv_21": "21D Realized Vol",
+    "gk_vol_21": "21D Garman-Klass Vol",
+    "garch_vol_forecast": "GARCH(1,1) Forecast Vol",
+    "vol_ratio_5_21": "Short/Medium Vol Ratio",
+    "beta_market_63": "63D Market Beta",
+    "idio_ret_5": "5D Idiosyncratic Return",
+    "idio_ret_21": "21D Idiosyncratic Return",
+    "corr21_nsei": "21D Correlation to NIFTY 50",
+    "corr21_gold_fut": "21D Correlation to COMEX Gold",
+    "corr21_silver_fut": "21D Correlation to COMEX Silver",
+    "corr21_usdinr": "21D Correlation to USD/INR",
+    "corr21_spy": "21D Correlation to S&P 500",
+    "corr21_vix": "21D Correlation to VIX",
+    "drv_usdinr_ret5": "USD/INR 5D FX Move",
+    "drv_gold_fut_ret5": "COMEX Gold 5D Move",
+    "drv_silver_fut_ret5": "COMEX Silver 5D Move",
+    "drv_nsei_ret5": "NIFTY 50 5D Move",
+    "sig_classical_trend": "Classical Trend Signal",
+    "sig_classical_mean_rev": "Classical Mean-Reversion Signal",
+    "sig_classical_momentum": "Classical Momentum Signal",
+    "sig_macro_risk_on": "Macro Risk-On Composite",
+    "cs_rank_ret1": "1D Peer Return Rank (0-1)",
+    "cs_rank_ret5": "5D Peer Momentum Rank (0-1)",
+    "cs_rank_ret21": "21D Peer Momentum Rank (0-1)",
+    "cs_rel_ret5_diff": "5D Excess Return vs Peers",
+    "cs_rel_ret21_diff": "21D Excess Return vs Peers",
+    "cs_rank_rv21": "21D Peer Volatility Rank",
+    "cs_rank_rsi14": "14D Peer RSI Rank",
+    "cs_rank_amihud21": "21D Liquidity Rank",
+    "cs_rank_idio21": "21D Idiosyncratic Alpha Rank",
+}
+
+
+def humanize_feature_name(feature: str) -> str:
+    """Translate internal snake_case feature identifiers into crisp English labels."""
+    return _FEATURE_LABELS.get(feature, feature.replace("_", " ").title())
 
 
 def get_currency_symbol(ticker: str) -> str:
     """Return display currency symbol based on exchange suffix."""
     up = ticker.upper()
-    if up.endswith((".NS", ".BO")) or up in {"^NSEI", "^NSEBANK", "^CNXIT", "^INDIAVIX"}:
-        return "INR "
-    if up == "USDINR=X":
-        return "INR "
+    if up.endswith((".NS", ".BO")) or up in {"^NSEI", "^NSEBANK", "^CNXIT", "^INDIAVIX", "USDINR=X"}:
+        return "Rs "
     return "$"
 
 
@@ -40,13 +91,13 @@ def summarize_gate_status(track_record: Dict[str, Any]) -> Dict[str, Any]:
     verdict = str(track_record.get("edge_verdict", "No Edge vs Benchmark"))
 
     if passed:
-        headline = "VALIDATED EDGE (Live Portfolio Allocations Active)"
+        headline = "VALIDATED STATISTICAL EDGE (Live Portfolio Allocations Active)"
     else:
-        headline = "RESEARCH / GATED MODE (0.0% Live Allocation — Unproven Alpha vs. Buy & Hold)"
+        headline = "RESEARCH / PAPER-TRADING MODE (0.0% Auto-Allocation — Edge Unproven vs. Buy & Hold)"
 
     detail = (
-        f"OOS Meta-Ensemble: Sharpe={sharpe:.3f} | Alpha={alpha:+.2f}%/yr | "
-        f"HAC t={hac_t:.2f} (req >= 2.00) | DSR={dsr:.3f} (req >= 0.95) | Status: {verdict}"
+        f"OOS Meta-Ensemble: Sharpe = {sharpe:.3f} | Alpha = {alpha:+.2f}%/yr | "
+        f"HAC t-stat = {hac_t:.2f} (requires >= 2.00) | DSR = {dsr:.3f} (requires >= 0.95) | Status: {verdict}"
     )
     return {
         "passed": passed,
@@ -69,7 +120,7 @@ def _execution_rule_label(row: pd.Series) -> str:
     if cash_only and comp_ret < 0.0:
         return "Avoid / Exit Risk (Cash Long-Only)"
     if gated:
-        return "Gated Research Only (0% Alloc)"
+        return "Research Only (Gated 0% Alloc)"
     if raw_v == "NEUTRAL / HOLD":
         return "Hold / Below Cost Hurdle"
     return "Active Allocation"
@@ -285,3 +336,98 @@ def compute_capital_scenario(report: LivePredictionReport, capital: float) -> Di
         "take_profit_gain": round(take_profit_gain, 2),
         "gated_capital": round(gated_capital, 2),
     }
+
+
+def build_signal_justification(
+    report: LivePredictionReport,
+    position_capital: float = 100000.0,
+) -> List[Dict[str, str]]:
+    """Build 5 plain-English justification cards explaining WHY the prediction & gate status occurred."""
+    cards: List[Dict[str, str]] = []
+    cur = get_currency_symbol(report.ticker)
+
+    # 1. Quantitative drivers & ensemble agreement
+    top_drv_txt = "No local SHAP tree drivers computed for this call."
+    if report.top_drivers:
+        top3 = report.top_drivers[:3]
+        parts = [
+            f"{humanize_feature_name(str(d['feature']))} ({d['direction']}, impact {float(d['shap_impact']):+.3f})"
+            for d in top3
+        ]
+        top_drv_txt = "Top model drivers: " + "; ".join(parts) + "."
+    cards.append(
+        {
+            "title": "1. Quantitative Signal & Model Agreement",
+            "body": (
+                f"Pure Quant Forecast is **{report.quant_expected_ret_pct:+.2f}%** with **{report.prob_up_pct:.1f}%** "
+                f"upside probability and **{report.model_agreement_pct:.0f}%** consensus across 6 model families "
+                f"(raw classification: `{report.raw_verdict}`). {top_drv_txt}"
+            ),
+        }
+    )
+
+    # 2. Volatility, expected range & ATR risk bounds
+    vol_v = float(report.garch_ann_vol_pct)
+    vol_tier = "Low" if vol_v < 18.0 else ("Moderate" if vol_v < 30.0 else "Elevated / High Risk")
+    cards.append(
+        {
+            "title": "2. Risk, GARCH Volatility & Expected Band",
+            "body": (
+                f"GARCH(1,1) annualized volatility is **{vol_v:.1f}% ({vol_tier})** vs. 21-bar realized vol "
+                f"**{report.realized_vol21_pct:.1f}%**. Expected 1-sigma return range is "
+                f"**[{report.expected_range_low_pct:+.2f}%, {report.expected_range_high_pct:+.2f}%]**. "
+                f"ATR risk stop sits at **{cur}{report.stop_loss_price:,.2f}** and target at **{cur}{report.take_profit_price:,.2f}**."
+            ),
+        }
+    )
+
+    # 3. Market Regime & Cross-Asset Context
+    beta_val = (report.cross_asset_snapshot or {}).get("beta_market_63")
+    beta_str = f"63-day Market Beta = `{beta_val:.2f}`" if beta_val is not None else "Market Beta unavailable"
+    vix_str = f"`{report.vix_level}`" if report.vix_level is not None else "`N/A`"
+    cards.append(
+        {
+            "title": "3. HMM Market Regime & Macro Backdrop",
+            "body": (
+                f"Causal Market-Level HMM classifies current conditions as **{report.regime_label}** "
+                f"({report.regime_probs}). Reference VIX = {vix_str}; {beta_str}."
+            ),
+        }
+    )
+
+    # 4. News Sentiment Overlay
+    ns = report.news_summary or {}
+    n_art = int(ns.get("asset_article_count", 0)) + int(ns.get("macro_article_count", 0))
+    comp_sent = float(ns.get("composite_sentiment", 0.0))
+    sent_word = "Positive" if comp_sent > 0.08 else ("Negative" if comp_sent < -0.08 else "Neutral")
+    blend_note = (
+        f"Sentiment overlay blended into composite return (**{report.composite_expected_ret_pct:+.2f}%**)."
+        if n_art >= 2
+        else "Fewer than 2 matching headlines found; composite forecast equals pure quant score."
+    )
+    cards.append(
+        {
+            "title": "4. Live News & Narrative Context",
+            "body": f"Detected **{n_art}** recent asset/macro headlines with score **{comp_sent:+.3f} ({sent_word})**. {blend_note}",
+        }
+    )
+
+    # 5. Execution Rules, Real Broker Cost & PassGate Reliability
+    be_pct = estimate_round_trip_breakeven_pct(report.ticker, max(1000.0, position_capital), DEFAULT_FEE_SCHEDULE)
+    cash_rule = (
+        "NSE/BSE Cash Delivery is strictly **Long/Flat** (delivery shorting disabled)."
+        if is_cash_long_only_asset(report.ticker)
+        else "Both Long and Short directional trades are supported for this instrument."
+    )
+    cards.append(
+        {
+            "title": "5. Real-World Fees & Statistical Reliability Gate",
+            "body": (
+                f"Estimated round-trip delivery breakeven on {cur}{position_capital:,.0f} (including STT, Stamp, "
+                f"NSE Txn, GST & Rs 15.34 DP sell charge where applicable) is **{be_pct:.3f}%** vs. expected move "
+                f"**{report.composite_expected_ret_pct:+.2f}%**. {cash_rule} **Gate Status:** `{report.verdict}` "
+                f"({report.gate_reason})."
+            ),
+        }
+    )
+    return cards

@@ -24,7 +24,7 @@ def _sanitize_filename(value: str) -> str:
 def _cache_path(ticker: str, period: str, interval: str) -> Path:
     ensure_directories()
     safe = _sanitize_filename(f"{ticker}__{period}__{interval}")
-    return DATA_CACHE_DIR / "ohlcv" / f"{safe}.parquet"
+    return DATA_CACHE_DIR / "ohlcv" / f"{safe}__v2.parquet"
 
 
 def _is_cache_fresh(path: Path, ttl_hours: float) -> bool:
@@ -53,13 +53,16 @@ def _normalize_ohlcv_df(df: pd.DataFrame, interval: str) -> pd.DataFrame:
                 return pd.DataFrame()
 
     out = out[required].copy()
-    idx = pd.to_datetime(out.index, utc=True)
+    raw_idx = pd.to_datetime(out.index)
     if interval in {"1d", "1wk", "1mo"}:
-        # Daily bars are indexed by normalized UTC midnight date for cross-asset joins.
-        idx = idx.tz_convert("UTC").normalize().tz_localize(None)
+        # Preserve the exchange calendar date (e.g., NSE 2026-11-26 00:00+05:30 stays 2026-11-26)
+        if getattr(raw_idx, "tz", None) is not None:
+            idx = raw_idx.tz_localize(None).normalize()
+        else:
+            idx = raw_idx.normalize()
     else:
         # Intraday bars remain UTC-naive timestamps preserving exact bar close alignment.
-        idx = idx.tz_convert("UTC").tz_localize(None)
+        idx = pd.to_datetime(raw_idx, utc=True).tz_convert("UTC").tz_localize(None)
 
     out.index = idx
     out.index.name = "Timestamp"

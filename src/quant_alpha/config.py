@@ -121,6 +121,8 @@ UNIVERSES: Dict[str, List[str]] = {
         "JSWSTEEL.NS", "HINDALCO.NS", "HAL.NS", "BEL.NS", "ADANIENT.NS",
         "ADANIPORTS.NS", "NTPC.NS", "ONGC.NS", "POWERGRID.NS", "TRENT.NS",
         "ETERNAL.NS", "HCLTECH.NS", "WIPRO.NS",
+        # Crypto Exposure
+        "BTC-USD", "ETH-USD",
     ],
     "india_gold_silver": [
         "GOLDBEES.NS", "HDFCGOLD.NS", "GOLDCASE.NS",

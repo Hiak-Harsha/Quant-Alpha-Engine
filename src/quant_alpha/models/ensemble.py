@@ -163,10 +163,12 @@ def train_and_evaluate_walkforward(
 
     for fold_id, (tr_idx, te_idx) in enumerate(splitter.split(timestamps)):
         logger.info("Walk-forward fold %d: train=%d rows, test=%d rows", fold_id + 1, len(tr_idx), len(te_idx))
-        # Fit HMM regime detector strictly on training fold to prevent regime leakage
-        reg_detector = MarketRegimeDetector(random_state=random_state).fit(X_base.iloc[tr_idx])
-        tr_regime = reg_detector.predict_proba(X_base.iloc[tr_idx])
-        te_regime = reg_detector.predict_proba(X_base.iloc[te_idx])
+        # Fit chronological market-level HMM strictly on training fold to avoid interleaving & leakage
+        reg_detector = MarketRegimeDetector(random_state=random_state).fit(
+            X_base.iloc[tr_idx], timestamps=timestamps.iloc[tr_idx]
+        )
+        tr_regime = reg_detector.predict_proba(X_base.iloc[tr_idx], timestamps=timestamps.iloc[tr_idx])
+        te_regime = reg_detector.predict_proba(X_base.iloc[te_idx], timestamps=timestamps.iloc[te_idx])
 
         X_tr = pd.concat([X_base.iloc[tr_idx].reset_index(drop=True), tr_regime.reset_index(drop=True)], axis=1)
         X_te = pd.concat([X_base.iloc[te_idx].reset_index(drop=True), te_regime.reset_index(drop=True)], axis=1)
@@ -241,9 +243,9 @@ def train_and_evaluate_walkforward(
     ens_sign = np.sign(oof_df["pred_vol_ensemble"].to_numpy())[:, None]
     oof_df["model_agreement_pct"] = (np.sign(vol_preds_mat) == ens_sign).mean(axis=1) * 100.0
 
-    # Fit final production models on 100% of available labeled history
-    final_regime = MarketRegimeDetector(random_state=random_state).fit(X_base)
-    full_regime_df = final_regime.predict_proba(X_base)
+    # Fit final production models on 100% of available canonical history
+    final_regime = MarketRegimeDetector(random_state=random_state).fit(X_base, timestamps=timestamps)
+    full_regime_df = final_regime.predict_proba(X_base, timestamps=timestamps)
     X_full = pd.concat([X_base.reset_index(drop=True), full_regime_df.reset_index(drop=True)], axis=1)
 
     final_models: Dict[str, Tuple[Any, Any]] = {}

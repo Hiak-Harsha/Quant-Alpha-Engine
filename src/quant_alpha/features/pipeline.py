@@ -10,6 +10,10 @@ import pandas as pd
 
 from quant_alpha.config import HorizonConfig
 from quant_alpha.features.cross_asset import build_cross_asset_features
+from quant_alpha.features.cross_sectional import (
+    add_cross_sectional_features,
+    select_canonical_tickers,
+)
 from quant_alpha.features.technical import compute_technical_features
 from quant_alpha.features.volatility import compute_volatility_features
 
@@ -22,6 +26,7 @@ class PreparedDataset:
     latest_df: pd.DataFrame
     feature_cols: List[str]
     ticker_to_id: Dict[str, float]
+    canonical_tickers: List[str]
     target_ret_col: str = "target_fwd_ret"
     target_vol_ret_col: str = "target_vol_norm_ret"
     target_dir_col: str = "target_up"
@@ -113,10 +118,17 @@ def build_universe_dataset(
     panel_df = pd.concat(frames, ignore_index=True)
     panel_df["Timestamp"] = pd.to_datetime(panel_df["Timestamp"])
     panel_df = panel_df.sort_values(["Timestamp", "ticker"]).reset_index(drop=True)
+    panel_df = add_cross_sectional_features(panel_df)
 
     latest_df = pd.concat(latest_rows, ignore_index=True) if latest_rows else pd.DataFrame()
     if not latest_df.empty:
         latest_df["Timestamp"] = pd.to_datetime(latest_df["Timestamp"])
+        latest_df = add_cross_sectional_features(latest_df)
+
+    present_tickers = sorted(panel_df["ticker"].unique().tolist())
+    canonical = select_canonical_tickers(present_tickers)
+    if len(canonical) < len(present_tickers):
+        panel_df = panel_df[panel_df["ticker"].isin(canonical)].sort_values(["Timestamp", "ticker"]).reset_index(drop=True)
 
     meta_cols = {
         "Timestamp",
@@ -142,6 +154,7 @@ def build_universe_dataset(
         latest_df=latest_df,
         feature_cols=valid_features,
         ticker_to_id={k: float(v) for k, v in ticker_to_id.items()},
+        canonical_tickers=canonical,
     )
 
 
