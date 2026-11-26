@@ -38,6 +38,14 @@ from quant_alpha.predictor import (
     predict_multi_horizon_matrix,
     scan_market_predictions,
 )
+from quant_alpha.ui.components import (
+    build_metals_spotlight_df,
+    build_screener_display_df,
+    build_upside_downside_watchlists,
+    compute_capital_scenario,
+    format_pulse_value,
+    summarize_gate_status,
+)
 
 st.set_page_config(
     page_title="Quant Alpha Engine | Multi-Horizon Trading & Prediction",
@@ -72,7 +80,8 @@ def _cached_market_bundle(
         if india_focus:
             cands = [
                 s for s in cands
-                if s.endswith((".NS", ".BO")) or s in {"GOLDBEES.NS", "SILVERBEES.NS", "GC=F", "SI=F", "GLD", "SLV", "USDINR=X", "^NSEI", "^NSEBANK"}
+                if s.endswith((".NS", ".BO"))
+                or s in {"GOLDBEES.NS", "SILVERBEES.NS", "GC=F", "SI=F", "GLD", "SLV", "USDINR=X", "^NSEI", "^NSEBANK"}
             ]
         scan_tickers.extend(cands[:max_trending])
 
@@ -91,7 +100,7 @@ def _cached_market_scan(
     _macro_df: pd.DataFrame,
     _scored_news: pd.DataFrame,
     _bundle: dict,
-) -> tuple[pd.DataFrame, dict]:
+) -> tuple[pd.DataFrame, dict, dict]:
     out = scan_market_predictions(
         horizon_name=horizon_name,
         universe_name=universe_name,
@@ -102,11 +111,15 @@ def _cached_market_scan(
         scored_news=_scored_news,
         bundle=_bundle,
     )
-    return out.scan_df, out.skipped_tickers
+    return out.scan_df, out.skipped_tickers, out.horizon_track_record
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
-def _cached_backtest(horizon_name: str, _oof_df: pd.DataFrame, model_names: tuple[str, ...]) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def _cached_backtest(
+    horizon_name: str,
+    _oof_df: pd.DataFrame,
+    model_names: tuple[str, ...],
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     from quant_alpha.config import ARTIFACTS_DIR
 
     hdir = ARTIFACTS_DIR / horizon_name
@@ -156,18 +169,25 @@ def main() -> None:
     ensure_directories()
     st.title("Quant Alpha Engine — India Market, Gold/Silver ETFs & Live Monitor")
     st.caption(
-        f"{_nse_market_status_str()} • Combines LightGBM, XGBoost, ExtraTrees, Regularized Ridge/Logistic, Neural MLP, "
-        "Classical Quant Signals, GARCH(1,1) Vol, Gaussian HMM Regimes, USD/INR, COMEX Gold/Silver, & Indian/Global News NLP."
+        f"{_nse_market_status_str()} • Closed-bar causal predictions across LightGBM, XGBoost, ExtraTrees, "
+        "Ridge/Logistic, Neural MLP, Classical Quant Signals, GARCH(1,1) Vol & Gaussian HMM Regimes."
     )
 
     with st.sidebar:
         st.header("Configuration")
         universe_name = st.selectbox("Asset Universe", list(UNIVERSES.keys()), index=0)
         horizon_name = st.selectbox(
-            "Primary Trading Style / Horizon",
+            "Prediction Horizon",
             list(HORIZON_CONFIGS.keys()),
-            index=1,
+            index=0,
             format_func=lambda k: HORIZON_CONFIGS[k].display_name,
+        )
+        scenario_capital = st.number_input(
+            "What-If Position Size (Scenario Estimator)",
+            min_value=1000.0,
+            max_value=100000000.0,
+            value=100000.0,
+            step=10000.0,
         )
         st.divider()
         st.subheader("Live Monitor Controls")
@@ -186,7 +206,7 @@ def main() -> None:
         custom_ticker = st.text_input("Or Custom Ticker (e.g., TATAPOWER.NS, GOLDBEES.NS)", value="").strip().upper()
         ticker = custom_ticker or selected_ticker
 
-        run_all_horizons = st.checkbox("Compute All-Horizons Consensus (Intraday + Swing + Long-Term)", value=False)
+        run_all_horizons = st.checkbox("Compute All-Horizons Matrix (Intraday + Next-Day + Swing + Long-Term)", value=False)
         tune_trials = st.slider("Optuna Tuning Trials (when retraining)", min_value=5, max_value=30, value=12)
         retrain_clicked = st.button("Train / Retune Active Horizon", type="primary")
 
@@ -219,7 +239,7 @@ def main() -> None:
         st.cache_data.clear()
         st.success(f"Completed purged walk-forward training and saved artifacts for '{horizon_name}'.")
 
-    with st.spinner("Loading top stocks, live trending tickers, macro, volatility & news feeds..."):
+    with st.spinner("Loading stocks, Gold/Silver ETFs, macro, volatility & news feeds..."):
         ohlcv_map, macro_df, scored_news, trending_df = _cached_market_bundle(
             universe_name, horizon_name, ticker, include_trending, max_trending
         )
@@ -237,7 +257,7 @@ def main() -> None:
 
     tabs = st.tabs(
         [
-            "India & Metals Live Scanner",
+            "India & Metals Watchlist",
             "Single-Asset Deep Dive",
             "Walk-Forward Backtest & Leaderboard",
             "Cross-Asset Correlation & Volatility",
@@ -246,11 +266,11 @@ def main() -> None:
         ]
     )
 
-    # ------------------------------------------------------------------ TAB 1: SCANNER
+    # ------------------------------------------------------------------ TAB 1: SCANNER & WATCHLISTS
     with tabs[0]:
-        st.subheader(f"Live Signals: Indian Shares, Gold & Silver ETFs ({HORIZON_CONFIGS[horizon_name].display_name})")
+        hcfg = HORIZON_CONFIGS[horizon_name]
+        st.subheader(f"Market Watchlist & Outlook — {hcfg.display_name}")
 
-        # Live Market & Precious Metals Pulse Bar
         pulse_tickers = ["^NSEI", "^NSEBANK", "^INDIAVIX", "USDINR=X", "GOLDBEES.NS", "SILVERBEES.NS"]
         p_cols = st.columns(len(pulse_tickers))
         for idx_p, pt in enumerate(pulse_tickers):
@@ -258,11 +278,11 @@ def main() -> None:
             if pdf is not None and len(pdf) >= 2:
                 last_v = float(pdf["Close"].iloc[-1])
                 chg_v = float(pdf["Close"].pct_change(1).iloc[-1] * 100.0)
-                p_cols[idx_p].metric(pt, f"{last_v:,.2f}", f"{chg_v:+.2f}%")
+                p_cols[idx_p].metric(pt, format_pulse_value(pt, last_v), f"{chg_v:+.2f}%")
             else:
                 p_cols[idx_p].metric(pt, "N/A")
 
-        scan_df, skipped_map = _cached_market_scan(
+        scan_df, skipped_map, horizon_tr = _cached_market_scan(
             horizon_name,
             universe_name,
             include_trending,
@@ -272,57 +292,82 @@ def main() -> None:
             scored_news,
             bundle,
         )
+
+        gate_info = summarize_gate_status(horizon_tr)
+        if gate_info["passed"]:
+            st.success(f"**{gate_info['headline']}** — {gate_info['detail']}")
+        else:
+            st.warning(
+                f"**{gate_info['headline']}**\n\n"
+                f"{gate_info['detail']}. "
+                "The **Top Potential Upside** and **Top Potential Downside / Risk** tables below show the model's raw closed-bar forecasts "
+                "for objective research & paper tracking while keeping live allocation locked at `0.0%`."
+            )
+
         if scan_df.empty:
             st.warning("No predictions generated across scanned tickers.")
         else:
-            metals_df = scan_df[scan_df["market"] == "Gold / Silver ETF"].copy()
-            if not metals_df.empty:
-                st.markdown("### Gold & Silver ETFs + Bullion Spotlight")
-                metal_cols = [
-                    "ticker", "close", "chg_1_pct", "verdict", "composite_ret_pct",
-                    "prob_up_pct", "consensus_pct", "garch_vol_pct", "regime",
-                    "alloc_pct", "stop_loss", "take_profit",
-                ]
-                st.dataframe(metals_df[metal_cols], width="stretch", hide_index=True)
-
-            bull_n = int(scan_df["verdict"].str.contains("BULLISH").sum())
-            bear_n = int(scan_df["verdict"].str.contains("BEARISH").sum())
-            neut_n = int((scan_df["verdict"] == "NEUTRAL / HOLD").sum())
-            gated_n = int((scan_df["verdict"] == "NO EDGE / GATED").sum())
+            raw_bull = int(scan_df["raw_verdict"].astype(str).str.contains("BULLISH").sum())
+            raw_bear = int(scan_df["raw_verdict"].astype(str).str.contains("BEARISH").sum())
+            raw_neut = int((scan_df["raw_verdict"] == "NEUTRAL / HOLD").sum())
             gross_alloc = float(scan_df["alloc_pct"].abs().sum())
 
             s1, s2, s3, s4, s5 = st.columns(5)
-            s1.metric("Assets Predicted", len(scan_df), f"Skipped: {len(skipped_map)}")
-            s2.metric("Bullish / Bearish", f"{bull_n} / {bear_n}", f"Gross Alloc: {gross_alloc:.1f}%")
-            s3.metric("Neutral / Below Hurdle", neut_n)
-            s4.metric("Gated (No Proven Alpha)", gated_n)
+            s1.metric("Assets Scanned", len(scan_df), f"Skipped: {len(skipped_map)}")
+            s2.metric("Raw Bullish / Bearish", f"{raw_bull} / {raw_bear}", "Ungated model view")
+            s3.metric("Raw Neutral / Hold", raw_neut)
+            s4.metric("Live Portfolio Gross", f"{gross_alloc:.1f}%", "Gate Active" if not gate_info["passed"] else "Live Cap <= 100%")
             s5.metric("Buzzed / News Active", int((scan_df["buzz_score"] > 0).sum()), f"Trending: {len(trending_df)}")
 
-            f_col1, f_col2, f_col3 = st.columns([1.2, 1.2, 1.3])
+            gainers_df, decliners_df = build_upside_downside_watchlists(scan_df, top_n=12)
+
+            st.markdown("### Potential Profit Candidates (Top Raw Model Upside)")
+            if not gainers_df.empty:
+                st.dataframe(gainers_df, width="stretch", hide_index=True)
+            else:
+                st.info("No positive expected-return candidates on this closed-bar scan.")
+
+            st.markdown("### Potential Loss / Downside Risk Candidates (Avoid Cash Longs / Short Watch)")
+            if not decliners_df.empty:
+                st.dataframe(decliners_df, width="stretch", hide_index=True)
+            else:
+                st.info("No negative expected-return candidates on this closed-bar scan.")
+
+            metals_df = build_metals_spotlight_df(scan_df)
+            if not metals_df.empty:
+                st.markdown("### Gold & Silver ETFs + Bullion Spotlight")
+                st.dataframe(metals_df, width="stretch", hide_index=True)
+
+            st.markdown("### Full Universe Screener & Paper-Trade Logging")
+            f_col1, f_col2, f_col3, f_col4 = st.columns([1.1, 1.1, 1.1, 1.2])
             with f_col1:
                 mkt_filter = st.multiselect(
-                    "Filter Market",
+                    "Market Segment",
                     sorted(scan_df["market"].unique().tolist()),
                     default=sorted(scan_df["market"].unique().tolist()),
                 )
             with f_col2:
+                search_q = st.text_input("Search Ticker", value="").strip().upper()
+            with f_col3:
                 sig_filter = st.selectbox(
-                    "Signal Filter",
-                    ["All Assets", "Actionable Only (Bullish/Bearish)", "Bullish Only", "Bearish Only", "Trending / Buzzed Only"],
+                    "Model Signal Filter",
+                    ["All Assets", "Raw Bullish Only", "Raw Bearish Only", "Passed Edge Gate Only", "Trending / Buzzed Only"],
                     index=0,
                 )
-            with f_col3:
+            with f_col4:
                 log_top_btn = st.button("Log Top 12 Actionable Picks to Paper Ledger", width="stretch")
 
-            view_df = scan_df[scan_df["market"].isin(mkt_filter)].copy()
-            if sig_filter == "Actionable Only (Bullish/Bearish)":
-                view_df = view_df[~view_df["verdict"].isin({"NEUTRAL / HOLD", "NO EDGE / GATED"})]
-            elif sig_filter == "Bullish Only":
-                view_df = view_df[view_df["verdict"].str.contains("BULLISH")]
-            elif sig_filter == "Bearish Only":
-                view_df = view_df[view_df["verdict"].str.contains("BEARISH")]
+            filtered = scan_df[scan_df["market"].isin(mkt_filter)].copy()
+            if search_q:
+                filtered = filtered[filtered["ticker"].astype(str).str.contains(search_q, regex=False)]
+            if sig_filter == "Raw Bullish Only":
+                filtered = filtered[filtered["raw_verdict"].astype(str).str.contains("BULLISH")]
+            elif sig_filter == "Raw Bearish Only":
+                filtered = filtered[filtered["raw_verdict"].astype(str).str.contains("BEARISH")]
+            elif sig_filter == "Passed Edge Gate Only":
+                filtered = filtered[filtered["gate_passed"] == True]  # noqa: E712
             elif sig_filter == "Trending / Buzzed Only":
-                view_df = view_df[view_df["buzz_score"] > 0]
+                filtered = filtered[filtered["buzz_score"] > 0]
 
             if log_top_btn:
                 actionable_tickers = (
@@ -340,35 +385,36 @@ def main() -> None:
                         )
                     st.success(f"Logged/checked {len(events)} closed-bar signals in Live Paper Tracker.")
                 else:
-                    st.info("No actionable non-gated signals available to log for this horizon.")
+                    st.info("No non-gated actionable signals to log right now (Tab 6 lets you log research universe calls).")
 
-            st.dataframe(view_df, width="stretch", hide_index=True)
+            screener_df = build_screener_display_df(filtered)
+            st.dataframe(screener_df, width="stretch", hide_index=True)
 
-            actionable_plot = view_df[~view_df["verdict"].isin({"NEUTRAL / HOLD", "NO EDGE / GATED"})].head(16)
-            if not actionable_plot.empty:
+            plot_src = filtered[filtered["raw_verdict"] != "NEUTRAL / HOLD"].sort_values("composite_ret_pct", key=lambda s: s.abs(), ascending=False).head(16)
+            if not plot_src.empty:
                 fig_scan = px.bar(
-                    actionable_plot.sort_values("composite_ret_pct"),
+                    plot_src.sort_values("composite_ret_pct"),
                     x="composite_ret_pct",
                     y="ticker",
                     orientation="h",
-                    color="verdict",
+                    color="raw_verdict",
                     color_discrete_map={
                         "STRONG BULLISH": "#15803d",
                         "LEAN BULLISH": "#22c55e",
                         "LEAN BEARISH": "#f87171",
                         "STRONG BEARISH": "#b91c1c",
                     },
-                    title="Top High-Conviction Composite Expected Return (%)",
+                    title=f"Raw Model Expected Return (%) — Top 16 Directional Moves ({hcfg.display_name})",
                 )
                 st.plotly_chart(fig_scan, width="stretch")
 
-            with st.expander("Live Trending & Most-Talked-About Discovery Feed (Yahoo Trending + Most Active + Gainers/Losers + News Buzz)"):
+            with st.expander("Live Trending & Most-Talked-About Discovery Feed"):
                 if not trending_df.empty:
                     st.dataframe(trending_df.head(30), width="stretch", hide_index=True)
                 if skipped_map:
-                    st.caption(f"Skipped newly-listed/sparse tickers (<70 bars): {skipped_map}")
+                    st.caption(f"Skipped tickers lacking history (<70 bars): {skipped_map}")
 
-    # ------------------------------------------------------------------ TAB 2: SINGLE ASSET
+    # ------------------------------------------------------------------ TAB 2: SINGLE ASSET DEEP DIVE
     with tabs[1]:
         report = None
         try:
@@ -383,27 +429,40 @@ def main() -> None:
                 bundle=bundle,
             )
         except Exception as exc:
-            st.error(f"Prediction failed for {ticker}: {exc}")
+            st.error(f"Could not generate live prediction for {ticker}: {exc}")
 
         if report is not None:
+            st.caption(
+                f"Closed Bar Used: **{report.as_of_timestamp}** | Horizon: **{report.horizon_display}** | "
+                f"Gate Reason: **{report.gate_reason}**"
+            )
             c1, c2, c3, c4, c5 = st.columns(5)
-            c1.metric("Verdict", report.verdict, f"Close: {report.last_close}")
+            c1.metric("Gate Status", report.verdict, f"Raw Model: {report.raw_verdict}")
             c2.metric(
-                "Composite Expected Return",
+                "Est. Expected Move",
                 f"{report.composite_expected_ret_pct:+.2f}%",
-                f"Pure Quant: {report.quant_expected_ret_pct:+.2f}%",
+                f"Close: {format_pulse_value(report.ticker, report.last_close)}",
             )
             c3.metric("Upside Probability", f"{report.prob_up_pct:.1f}%", f"Consensus: {report.model_agreement_pct:.0f}%")
             c4.metric(
                 "GARCH Annual Vol",
                 f"{report.garch_ann_vol_pct:.1f}%",
-                f"21d RV: {report.realized_vol21_pct:.1f}%",
+                f"21-bar RV: {report.realized_vol21_pct:.1f}%",
             )
             c5.metric(
-                "Vol-Targeted Allocation",
+                "Live Allocation",
                 f"{report.suggested_allocation_pct:+.1f}%",
                 f"Stop {report.stop_loss_price} / TP {report.take_profit_price}",
             )
+
+            scen = compute_capital_scenario(report, scenario_capital)
+            st.subheader(f"Objective Risk & Return Scenario (Hypothetical Position: {scen['capital']:,.0f})")
+            sc1, sc2, sc3, sc4, sc5 = st.columns(5)
+            sc1.metric("Est. Expected P&L", f"{scen['expected_pnl']:+,.0f}", f"{report.composite_expected_ret_pct:+.2f}%")
+            sc2.metric("1-Sigma Downside", f"{scen['range_low_pnl']:+,.0f}", f"{report.expected_range_low_pct:+.2f}%")
+            sc3.metric("1-Sigma Upside", f"{scen['range_high_pnl']:+,.0f}", f"{report.expected_range_high_pct:+.2f}%")
+            sc4.metric("ATR Stop-Loss Risk", f"{scen['stop_loss_risk']:+,.0f}", f"Stop @ {report.stop_loss_price}")
+            sc5.metric("ATR Target Reward", f"{scen['take_profit_gain']:+,.0f}", f"Live Gated Capital: {scen['gated_capital']:,.0f}")
 
             st.info(
                 f"**HMM Market Regime:** {report.regime_label} ({report.regime_probs}) | "
@@ -419,7 +478,7 @@ def main() -> None:
                     f"Sharpe = {tr.get('sharpe')} (95% Block-CI [{tr.get('sharpe_ci_low')}, {tr.get('sharpe_ci_high')}]), "
                     f"Alpha = {tr.get('alpha_ann_pct')}% (HAC t={tr.get('hac_t_stat')}, DSR={tr.get('dsr_prob')}), "
                     f"Spearman IC = {tr.get('spearman_ic')}, Max Drawdown = {tr.get('max_drawdown_pct')}% -> "
-                    f"**{tr.get('edge_verdict')}** ({report.gate_reason})"
+                    f"**{tr.get('edge_verdict')}**"
                 )
 
             col_l, col_r = st.columns(2)
@@ -456,8 +515,8 @@ def main() -> None:
                     st.write("SHAP local attribution unavailable for this model configuration.")
 
             if run_all_horizons:
-                st.subheader("Multi-Horizon Consensus Matrix (Intraday + Swing + Long-Term)")
-                with st.spinner("Evaluating Intraday, Swing, and Long-Term horizons..."):
+                st.subheader("Multi-Horizon Consensus Matrix (Intraday + Next-Day + Swing + Long-Term)")
+                with st.spinner("Evaluating all horizons..."):
                     try:
                         matrix_reports = predict_multi_horizon_matrix(
                             ticker=ticker, universe_name=universe_name, settings=settings
@@ -465,14 +524,14 @@ def main() -> None:
                         matrix_rows = [
                             {
                                 "Horizon": r.horizon_display,
-                                "Verdict": r.verdict,
-                                "Quant Ret %": r.quant_expected_ret_pct,
-                                "Composite Ret %": r.composite_expected_ret_pct,
+                                "Gate Status": r.verdict,
+                                "Model View": r.raw_verdict,
+                                "Est. Move %": r.composite_expected_ret_pct,
                                 "Prob Up %": r.prob_up_pct,
-                                "Model Consensus %": r.model_agreement_pct,
+                                "Consensus %": r.model_agreement_pct,
                                 "GARCH Vol %": r.garch_ann_vol_pct,
                                 "Regime": r.regime_label,
-                                "Alloc %": r.suggested_allocation_pct,
+                                "Live Alloc %": r.suggested_allocation_pct,
                                 "OOS Sharpe": r.backtest_track_record.get("sharpe"),
                             }
                             for r in matrix_reports
@@ -528,9 +587,7 @@ def main() -> None:
             )
         )
         corr_tickers = [t for t in corr_candidates if t in ohlcv_map][:18]
-        ret_series = {}
-        for t in corr_tickers:
-            ret_series[t] = ohlcv_map[t]["Close"].pct_change(1)
+        ret_series = {t: ohlcv_map[t]["Close"].pct_change(1) for t in corr_tickers}
         corr_df = pd.DataFrame(ret_series).tail(252).corr().round(2)
         if not corr_df.empty:
             fig_corr = px.imshow(
@@ -612,7 +669,7 @@ def main() -> None:
             log_horizons = st.multiselect(
                 "Horizons to Log",
                 list(HORIZON_CONFIGS.keys()),
-                default=["swing", "intraday"],
+                default=["next_day", "swing"],
             )
         with p_col2:
             log_btn = st.button("Log Closed-Bar Signals (Universe)", width="stretch")

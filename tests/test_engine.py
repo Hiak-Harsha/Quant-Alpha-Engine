@@ -489,3 +489,127 @@ def test_live_functions_default_closed_bars_only() -> None:
     assert inspect.signature(predict_asset).parameters["closed_bars_only"].default is True
     assert inspect.signature(scan_market_predictions).parameters["closed_bars_only"].default is True
 
+
+def test_next_day_horizon_and_modular_ui_watchlists() -> None:
+    from quant_alpha.config import HORIZON_CONFIGS
+    from quant_alpha.ui.components import (
+        build_metals_spotlight_df,
+        build_upside_downside_watchlists,
+        compute_capital_scenario,
+        format_pulse_value,
+        summarize_gate_status,
+    )
+
+    assert "next_day" in HORIZON_CONFIGS
+    assert HORIZON_CONFIGS["next_day"].forecast_horizon == 1
+
+    assert format_pulse_value("^NSEI", 25884.9) == "25,885"
+    assert format_pulse_value("GOLDBEES.NS", 100.96) == "Rs 100.96"
+
+    gate_fail = summarize_gate_status({"gate_passed": False, "alpha_ann_pct": 1.2, "hac_t_stat": 0.9, "dsr_prob": 0.5, "sharpe": 1.1})
+    assert gate_fail["passed"] is False
+    assert "0.0%" in gate_fail["headline"]
+
+    sample_scan = pd.DataFrame(
+        [
+            {
+                "ticker": "RELIANCE.NS",
+                "market": "India Stock (.NS)",
+                "as_of": "2026-11-26",
+                "close": 1380.0,
+                "chg_1_pct": 0.5,
+                "verdict": "NO EDGE / GATED",
+                "raw_verdict": "STRONG BULLISH",
+                "cash_long_only": True,
+                "composite_ret_pct": 1.4,
+                "range_low_pct": -0.5,
+                "range_high_pct": 3.3,
+                "prob_up_pct": 66.0,
+                "consensus_pct": 83.3,
+                "garch_vol_pct": 22.0,
+                "stop_loss": 1340.0,
+                "take_profit": 1440.0,
+                "alloc_pct": 0.0,
+            },
+            {
+                "ticker": "TCS.NS",
+                "market": "India Stock (.NS)",
+                "as_of": "2026-11-26",
+                "close": 2500.0,
+                "chg_1_pct": -0.8,
+                "verdict": "NO EDGE / GATED",
+                "raw_verdict": "LEAN BEARISH",
+                "cash_long_only": True,
+                "composite_ret_pct": -1.1,
+                "range_low_pct": -2.8,
+                "range_high_pct": 0.6,
+                "prob_up_pct": 38.0,
+                "consensus_pct": 66.7,
+                "garch_vol_pct": 24.0,
+                "stop_loss": 2550.0,
+                "take_profit": 2420.0,
+                "alloc_pct": 0.0,
+            },
+            {
+                "ticker": "GOLDBEES.NS",
+                "market": "Gold / Silver ETF",
+                "as_of": "2026-11-26",
+                "close": 100.96,
+                "chg_1_pct": 0.85,
+                "verdict": "NO EDGE / GATED",
+                "raw_verdict": "NEUTRAL / HOLD",
+                "cash_long_only": True,
+                "composite_ret_pct": -0.4,
+                "range_low_pct": -2.1,
+                "range_high_pct": 1.3,
+                "prob_up_pct": 49.0,
+                "consensus_pct": 33.3,
+                "garch_vol_pct": 31.0,
+                "stop_loss": 97.5,
+                "take_profit": 105.0,
+                "alloc_pct": 0.0,
+            },
+        ]
+    )
+    gainers, decliners = build_upside_downside_watchlists(sample_scan, top_n=5)
+    assert gainers["Ticker"].tolist() == ["RELIANCE.NS"]
+    assert decliners["Ticker"].tolist() == ["TCS.NS", "GOLDBEES.NS"]
+    assert "Cash Long-Only" in decliners.loc[0, "Execution Note"]
+    metals = build_metals_spotlight_df(sample_scan)
+    assert metals["Ticker"].tolist() == ["GOLDBEES.NS"]
+
+    rep = LivePredictionReport(
+        ticker="RELIANCE.NS",
+        horizon_name="next_day",
+        horizon_display="Next Day",
+        as_of_timestamp="2026-11-26",
+        last_close=1000.0,
+        verdict="NO EDGE / GATED",
+        quant_expected_ret_pct=1.5,
+        composite_expected_ret_pct=1.5,
+        expected_range_low_pct=-1.0,
+        expected_range_high_pct=4.0,
+        prob_up_pct=65.0,
+        model_agreement_pct=83.3,
+        model_disagreement_std=0.1,
+        cost_hurdle_pct=0.1,
+        suggested_allocation_pct=0.0,
+        stop_loss_price=980.0,
+        take_profit_price=1040.0,
+        garch_ann_vol_pct=20.0,
+        realized_vol21_pct=19.0,
+        vix_level=16.8,
+        regime_label="Low-Vol Bull",
+        regime_probs={},
+        news_summary={},
+        model_breakdown=[],
+        top_drivers=[],
+        cross_asset_snapshot={},
+    )
+    scen = compute_capital_scenario(rep, 100000.0)
+    assert scen["expected_pnl"] == 1500.0
+    assert scen["stop_loss_risk"] == -2000.0
+    assert scen["take_profit_gain"] == 4000.0
+    assert scen["gated_capital"] == 0.0
+
+

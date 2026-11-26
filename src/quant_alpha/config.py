@@ -37,6 +37,22 @@ class HorizonConfig:
 
 
 HORIZON_CONFIGS: Dict[str, HorizonConfig] = {
+    "next_day": HorizonConfig(
+        name="next_day",
+        display_name="Next Day / Tomorrow (1D Bars -> 1D Horizon)",
+        interval="1d",
+        period="10y",
+        forecast_horizon=1,
+        purge_bars=3,
+        embargo_bars=2,
+        tx_cost_bps=3.0,
+        slippage_bps=2.0,
+        bars_per_year=252,
+        target_vol_annual=0.15,
+        min_train_rows=500,
+        n_splits=5,
+        description="Next trading day (tomorrow) return, downside risk, and volatility range forecasts.",
+    ),
     "intraday": HorizonConfig(
         name="intraday",
         display_name="Intraday (1H Bars -> 4H Horizon)",

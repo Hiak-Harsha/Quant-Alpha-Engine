@@ -502,14 +502,14 @@ def predict_multi_horizon_matrix(
     settings: Optional[EngineSettings] = None,
     closed_bars_only: bool = True,
 ) -> List[LivePredictionReport]:
-    """Generate side-by-side Intraday, Swing, and Long-Term objective predictions."""
+    """Generate side-by-side Intraday, Next-Day, Swing, and Long-Term objective predictions."""
     settings = settings or EngineSettings()
     macro_df = load_all_macro_series(settings=settings)
     raw_news = fetch_all_news([ticker] + UNIVERSES.get(universe_name, [])[:25], settings=settings)
     scored_news = score_news_dataframe(raw_news)
 
     reports: List[LivePredictionReport] = []
-    for h_name in ("intraday", "swing", "longterm"):
+    for h_name in ("intraday", "next_day", "swing", "longterm"):
         reports.append(
             predict_asset(
                 ticker=ticker,
@@ -532,6 +532,7 @@ class MarketScanOutput:
     trending_df: pd.DataFrame
     reports: Dict[str, LivePredictionReport]
     skipped_tickers: Dict[str, str]
+    horizon_track_record: Dict[str, Any] = field(default_factory=dict)
 
 
 _METALS_TICKERS = {
@@ -661,7 +662,7 @@ def scan_market_predictions(
             skipped[t] = str(exc)
 
     if not reports:
-        return MarketScanOutput(pd.DataFrame(), trending_df, reports, skipped)
+        return MarketScanOutput(pd.DataFrame(), trending_df, reports, skipped, track_cache[0])
 
     # Joint portfolio construction across all scanned assets (bounded by cluster, sector, gross/net & cash rules)
     raw_series = pd.Series(
@@ -689,6 +690,7 @@ def scan_market_predictions(
             {
                 "ticker": t,
                 "market": _classify_market_bucket(t),
+                "as_of": rep.as_of_timestamp[:10],
                 "buzz_score": float(binfo.get("buzz_score", 0.0)),
                 "news_mentions": int(binfo.get("news_mentions", 0)),
                 "trending_tags": str(binfo.get("sources", "")),
@@ -697,8 +699,12 @@ def scan_market_predictions(
                 "verdict": rep.verdict,
                 "raw_verdict": rep.raw_verdict,
                 "gate_passed": rep.gate_passed,
+                "gate_reason": rep.gate_reason,
+                "cash_long_only": is_cash_long_only_asset(t, settings.portfolio),
                 "composite_ret_pct": rep.composite_expected_ret_pct,
                 "quant_ret_pct": rep.quant_expected_ret_pct,
+                "range_low_pct": rep.expected_range_low_pct,
+                "range_high_pct": rep.expected_range_high_pct,
                 "prob_up_pct": rep.prob_up_pct,
                 "consensus_pct": rep.model_agreement_pct,
                 "garch_vol_pct": rep.garch_ann_vol_pct,
@@ -719,4 +725,4 @@ def scan_market_predictions(
         .drop(columns=["_sort_act", "_sort_conv"])
         .reset_index(drop=True)
     )
-    return MarketScanOutput(scan_df, trending_df, reports, skipped)
+    return MarketScanOutput(scan_df, trending_df, reports, skipped, track_cache[0])
