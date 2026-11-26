@@ -741,4 +741,35 @@ def test_causal_market_hmm_cross_sectional_dedup_and_justification() -> None:
     assert "21D Peer Momentum Rank" in cards[0]["body"]
 
 
+def test_fastapi_endpoints_and_paper_flow() -> None:
+    from fastapi.testclient import TestClient
+
+    from quant_alpha.api.app import create_app
+
+    client = TestClient(create_app())
+    r_health = client.get("/api/health")
+    assert r_health.status_code == 200
+    assert r_health.json()["status"] == "ok"
+
+    r_cfg = client.get("/api/config")
+    assert r_cfg.status_code == 200
+    cfg = r_cfg.json()
+    assert "next_day" in cfg["horizons"]
+    assert "india_market_gold_silver" in cfg["universes"]
+
+    r_prev = client.post(
+        "/api/paper/preview",
+        json={"account_id": "default_student", "ticker": "GOLDBEES.NS", "side": "BUY", "qty": 10, "price": 100.0},
+    )
+    assert r_prev.status_code == 200
+    prev = r_prev.json()
+    assert prev["valid"] is True
+    assert prev["breakeven_move_pct"] > 0.0
+
+    r_corr = client.get("/api/paper/correlation")
+    assert r_corr.status_code == 200
+    assert "n_matured" in r_corr.json()
+
+
+
 

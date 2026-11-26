@@ -60,8 +60,9 @@ python -m quant_alpha.cli predict --ticker GOLDBEES.NS --all-horizons
 python -m quant_alpha.cli paper-log --universe india_market_gold_silver --horizons swing,intraday --refresh
 python -m quant_alpha.cli paper-eval
 
-# 5. Launch Streamlit dashboard
-streamlit run app.py
+# 5. Build frontend (first time) and launch FastAPI + React Quant Terminal Web App
+cd web && npm install && npm run build && cd ..
+python -m quant_alpha.cli serve --host 0.0.0.0 --port 8501
 ```
 
 ### Docker & Verification Checks

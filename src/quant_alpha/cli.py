@@ -360,6 +360,10 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("paper-eval", help="Grade open paper predictions once horizon bars settle and print report.")
     sub.add_parser("paper-report", help="Print live forward paper-trading scorecard and model accuracy.")
 
+    p_srv = sub.add_parser("serve", help="Launch the FastAPI + React Quant Terminal web application.")
+    p_srv.add_argument("--host", type=str, default="0.0.0.0")
+    p_srv.add_argument("--port", type=int, default=8501)
+
     return parser
 
 
@@ -382,6 +386,11 @@ def main(argv: List[str] | None = None) -> int:
         return cmd_paper_eval()
     if args.command == "paper-report":
         return cmd_paper_report()
+    if args.command == "serve":
+        import uvicorn
+
+        uvicorn.run("quant_alpha.api.app:app", host=args.host, port=args.port)
+        return 0
     return 1
 
 
