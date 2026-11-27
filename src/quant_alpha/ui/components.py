@@ -137,14 +137,18 @@ def _prepare_enriched_scan(scan_df: pd.DataFrame) -> pd.DataFrame:
     df["Est. Target"] = (close_s * (1.0 + ret_s / 100.0)).round(2)
 
     if "range_low_pct" in df.columns and "range_high_pct" in df.columns:
+        lo_s = pd.to_numeric(df["range_low_pct"], errors="coerce").fillna(0.0)
+        hi_s = pd.to_numeric(df["range_high_pct"], errors="coerce").fillna(0.0)
+        df["Pred. Range Price"] = [
+            f"{(c * (1.0 + lo / 100.0)):,.2f} - {(c * (1.0 + hi / 100.0)):,.2f}"
+            for c, lo, hi in zip(close_s, lo_s, hi_s)
+        ]
         df["Expected Range"] = [
             f"[{lo:+.2f}%, {hi:+.2f}%]"
-            for lo, hi in zip(
-                pd.to_numeric(df["range_low_pct"], errors="coerce").fillna(0.0),
-                pd.to_numeric(df["range_high_pct"], errors="coerce").fillna(0.0),
-            )
+            for lo, hi in zip(lo_s, hi_s)
         ]
     else:
+        df["Pred. Range Price"] = ""
         df["Expected Range"] = ""
 
     if "as_of" not in df.columns:
@@ -172,6 +176,7 @@ def build_upside_downside_watchlists(
         "raw_verdict",
         "composite_ret_pct",
         "Est. Target",
+        "Pred. Range Price",
         "Expected Range",
         "prob_up_pct",
         "consensus_pct",
@@ -237,6 +242,8 @@ def build_metals_spotlight_df(scan_df: pd.DataFrame) -> pd.DataFrame:
         "chg_1_pct",
         "raw_verdict",
         "composite_ret_pct",
+        "Est. Target",
+        "Pred. Range Price",
         "Expected Range",
         "prob_up_pct",
         "consensus_pct",
@@ -277,6 +284,7 @@ def build_screener_display_df(scan_df: pd.DataFrame) -> pd.DataFrame:
         "raw_verdict",
         "composite_ret_pct",
         "Est. Target",
+        "Pred. Range Price",
         "Expected Range",
         "prob_up_pct",
         "consensus_pct",

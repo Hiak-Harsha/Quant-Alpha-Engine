@@ -122,11 +122,11 @@ export function MarketRadar({ scan, loading, onSelectTicker, onQuickTrade }: Pro
               <thead>
                 <tr>
                   <th>Ticker</th>
-                  <th>Date</th>
-                  <th>Close</th>
+                  <th>Ref Date</th>
+                  <th>Prev Close</th>
                   <th>Model View</th>
                   <th>Est. Move</th>
-                  <th>Target</th>
+                  <th>Pred. Close</th>
                   <th>Up Prob</th>
                   <th>Agree</th>
                 </tr>
@@ -143,7 +143,9 @@ export function MarketRadar({ scan, loading, onSelectTicker, onQuickTrade }: Pro
                     <td className="num up" style={{ fontWeight: 700 }}>
                       +{Number(r["Est. Move %"]).toFixed(2)}%
                     </td>
-                    <td className="num">{Number(r["Target Price"] ?? r["Est. Target"]).toLocaleString(undefined, { maximumFractionDigits: 2 })}</td>
+                    <td className="num up" style={{ fontWeight: 700 }}>
+                      {Number(r["Est. Target"] ?? r["Last Close"]).toLocaleString(undefined, { maximumFractionDigits: 2 })}
+                    </td>
                     <td className="num">{Number(r["Up Prob %"]).toFixed(1)}%</td>
                     <td className="num">{Number(r["Model Agree %"]).toFixed(0)}%</td>
                   </tr>
@@ -165,10 +167,11 @@ export function MarketRadar({ scan, loading, onSelectTicker, onQuickTrade }: Pro
               <thead>
                 <tr>
                   <th>Ticker</th>
-                  <th>Date</th>
-                  <th>Close</th>
+                  <th>Ref Date</th>
+                  <th>Prev Close</th>
                   <th>Est. Move</th>
-                  <th>1-Sigma Range</th>
+                  <th>Pred. Close</th>
+                  <th>1-Sigma Band</th>
                   <th>Up Prob</th>
                   <th>Execution Rule</th>
                 </tr>
@@ -176,7 +179,7 @@ export function MarketRadar({ scan, loading, onSelectTicker, onQuickTrade }: Pro
               <tbody>
                 {decliners.length === 0 ? (
                   <tr>
-                    <td colSpan={7} className="muted">
+                    <td colSpan={8} className="muted">
                       No negative expected-return assets on this closed-bar scan.
                     </td>
                   </tr>
@@ -188,6 +191,9 @@ export function MarketRadar({ scan, loading, onSelectTicker, onQuickTrade }: Pro
                       <td className="num">{Number(r["Last Close"]).toLocaleString(undefined, { maximumFractionDigits: 2 })}</td>
                       <td className="num dn" style={{ fontWeight: 700 }}>
                         {Number(r["Est. Move %"]).toFixed(2)}%
+                      </td>
+                      <td className="num dn" style={{ fontWeight: 700 }}>
+                        {Number(r["Est. Target"] ?? r["Last Close"]).toLocaleString(undefined, { maximumFractionDigits: 2 })}
                       </td>
                       <td className="num muted">{r["Expected Range"]}</td>
                       <td className="num">{Number(r["Up Prob %"]).toFixed(1)}%</td>
@@ -215,12 +221,13 @@ export function MarketRadar({ scan, loading, onSelectTicker, onQuickTrade }: Pro
               <thead>
                 <tr>
                   <th>Ticker</th>
-                  <th>Bar Date</th>
-                  <th>Close</th>
+                  <th>Ref Date</th>
+                  <th>Prev Close</th>
                   <th>1-Bar Chg</th>
                   <th>Model View</th>
                   <th>Est. Move</th>
-                  <th>1-Sigma Band</th>
+                  <th>Pred. Close</th>
+                  <th>1-Sigma Price Band</th>
                   <th>Up Prob</th>
                   <th>Ann Vol</th>
                   <th>Gate / Note</th>
@@ -243,7 +250,10 @@ export function MarketRadar({ scan, loading, onSelectTicker, onQuickTrade }: Pro
                       {m["Est. Move %"] >= 0 ? "+" : ""}
                       {Number(m["Est. Move %"]).toFixed(2)}%
                     </td>
-                    <td className="num muted">{m["Expected Range"]}</td>
+                    <td className={`num ${m["Est. Move %"] >= 0 ? "up" : "dn"}`} style={{ fontWeight: 700 }}>
+                      {Number(m["Est. Target"] ?? m["Last Close"]).toLocaleString(undefined, { maximumFractionDigits: 2 })}
+                    </td>
+                    <td className="num muted">{m["Pred. Range Price"] || m["Expected Range"]}</td>
                     <td className="num">{Number(m["Up Prob %"]).toFixed(1)}%</td>
                     <td className="num">{Number(m["Ann Vol %"]).toFixed(1)}%</td>
                     <td style={{ fontSize: "0.76rem", color: "#fbbf24" }}>{m["Execution Note"]}</td>
@@ -295,6 +305,7 @@ export function MarketRadar({ scan, loading, onSelectTicker, onQuickTrade }: Pro
                 <th>1-Bar %</th>
                 <th>Model View</th>
                 <th>Est. Move</th>
+                <th>Pred. Close</th>
                 <th>Up Prob</th>
                 <th>Agree</th>
                 <th>GARCH Vol</th>
@@ -325,6 +336,9 @@ export function MarketRadar({ scan, loading, onSelectTicker, onQuickTrade }: Pro
                   <td className={`num ${r.composite_ret_pct >= 0 ? "up" : "dn"}`}>
                     {r.composite_ret_pct >= 0 ? "+" : ""}
                     {r.composite_ret_pct.toFixed(2)}%
+                  </td>
+                  <td className={`num ${r.composite_ret_pct >= 0 ? "up" : "dn"}`} style={{ fontWeight: 700 }}>
+                    {(r.close * (1 + r.composite_ret_pct / 100)).toLocaleString(undefined, { maximumFractionDigits: 2 })}
                   </td>
                   <td className="num">{r.prob_up_pct.toFixed(1)}%</td>
                   <td className="num">{r.consensus_pct.toFixed(0)}%</td>

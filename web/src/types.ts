@@ -45,6 +45,7 @@ export interface WatchlistRow {
   "Model View": string;
   "Est. Move %": number;
   "Est. Target"?: number;
+  "Pred. Range Price"?: string;
   "Expected Range"?: string;
   "Up Prob %": number;
   "Model Agree %": number;

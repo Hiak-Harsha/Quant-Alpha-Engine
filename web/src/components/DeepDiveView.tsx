@@ -182,13 +182,16 @@ export function DeepDiveView({
               <div className="metric-sub muted">Raw Model: {detail.report.raw_verdict}</div>
             </div>
             <div className="metric-card">
-              <div className="metric-label">Est. Expected Move</div>
+              <div className="metric-label">Pred. Closing Rate</div>
               <div className={`metric-value num ${detail.report.composite_expected_ret_pct >= 0 ? "up" : "dn"}`}>
-                {detail.report.composite_expected_ret_pct >= 0 ? "+" : ""}
-                {detail.report.composite_expected_ret_pct.toFixed(2)}%
+                {cur}
+                {(detail.report.last_close * (1 + detail.report.composite_expected_ret_pct / 100)).toLocaleString(undefined, {
+                  maximumFractionDigits: 2,
+                })}
               </div>
               <div className="metric-sub muted">
-                Close: {cur}
+                {detail.report.composite_expected_ret_pct >= 0 ? "+" : ""}
+                {detail.report.composite_expected_ret_pct.toFixed(2)}% vs Prev {cur}
                 {detail.report.last_close.toLocaleString(undefined, { maximumFractionDigits: 2 })}
               </div>
             </div>
