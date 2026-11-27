@@ -80,7 +80,7 @@ def _repair_trailing_daily_nan(
     raw: pd.DataFrame,
     norm: pd.DataFrame,
 ) -> pd.DataFrame:
-    """Backfill trailing daily bar if Yahoo returns NaN Close while 1h/fast_info has settled data."""
+    """Backfill trailing NaN or recently omitted daily bars using 1h bars and fast_info."""
     if raw is None or raw.empty or norm is None or norm.empty:
         return norm
 
@@ -88,7 +88,13 @@ def _repair_trailing_daily_nan(
     raw_local = raw_idx.tz_localize(None).normalize() if getattr(raw_idx, "tz", None) is not None else raw_idx.normalize()
     raw_max_date = pd.Timestamp(raw_local.max())
     norm_max_date = pd.Timestamp(norm.index.max())
-    if raw_max_date <= norm_max_date:
+
+    has_trailing_nan = raw_max_date > norm_max_date
+    has_recent_gap = False
+    if len(norm) >= 2:
+        tail_idx = norm.index[-min(4, len(norm)):]
+        has_recent_gap = any(int((tail_idx[i] - tail_idx[i - 1]).days) >= 2 for i in range(1, len(tail_idx)))
+    if not has_trailing_nan and not has_recent_gap:
         return norm
 
     try:
@@ -114,7 +120,10 @@ def _repair_trailing_daily_nan(
         h1_work.columns = [str(col[0]) for col in h1_work.columns]
     h1_work.columns = [str(c).strip().title() for c in h1_work.columns]
     h1_work["_day"] = h1_dates
-    missing_day_df = h1_work[h1_work["_day"] > norm_max_date].dropna(subset=["Close"])
+    existing_dates = set(norm.index)
+    window_start = pd.Timestamp(norm.index[-min(5, len(norm))])
+    missing_mask = (h1_work["_day"] >= window_start) & (~h1_work["_day"].isin(existing_dates))
+    missing_day_df = h1_work[missing_mask].dropna(subset=["Close"])
     if missing_day_df.empty:
         return norm
 

@@ -816,6 +816,33 @@ def test_daily_nan_backfill_from_intraday_and_fast_info() -> None:
     assert np.isclose(float(repaired["Open"].iloc[-1]), 139.5)
     assert np.isclose(float(repaired["Volume"].iloc[-1]), 110000.0)
 
+    # Also handle internal skipped date once next day's live bar (2026-11-27) opens
+    ist_daily_gap = pd.DatetimeIndex(["2026-11-25 00:00:00", "2026-11-27 00:00:00"]).tz_localize("Asia/Kolkata")
+    raw_gap = pd.DataFrame(
+        {
+            "Open": [140.0, 145.95],
+            "High": [142.0, 146.04],
+            "Low": [138.0, 144.61],
+            "Close": [138.40, 144.68],
+            "Volume": [100000.0, 3500000.0],
+        },
+        index=ist_daily_gap,
+    )
+    norm_gap = _normalize_ohlcv_df(raw_gap, interval="1d")
+
+    class _FakeOpenTicker(_FakeTicker):
+        class _FastInfo:
+            last_price = 144.68
+
+        fast_info = _FastInfo()
+
+    repaired_gap = _repair_trailing_daily_nan(_FakeOpenTicker(), raw_gap, norm_gap)
+    assert [d.strftime("%Y-%m-%d") for d in repaired_gap.index] == ["2026-11-25", "2026-11-26", "2026-11-27"]
+    # Internal missing bar must use settled 1h close (141.27), NOT today's live last_price (144.68)
+    assert np.isclose(float(repaired_gap.loc[pd.Timestamp("2026-11-26"), "Close"]), 141.27)
+    assert np.isclose(float(repaired_gap.loc[pd.Timestamp("2026-11-27"), "Close"]), 144.68)
+
+
 
 
 
