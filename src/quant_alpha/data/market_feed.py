@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import logging
+import math
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
 import yfinance as yf
@@ -74,6 +75,86 @@ def _normalize_ohlcv_df(df: pd.DataFrame, interval: str) -> pd.DataFrame:
     return out
 
 
+def _repair_trailing_daily_nan(
+    tk: Any,
+    raw: pd.DataFrame,
+    norm: pd.DataFrame,
+) -> pd.DataFrame:
+    """Backfill trailing daily bar if Yahoo returns NaN Close while 1h/fast_info has settled data."""
+    if raw is None or raw.empty or norm is None or norm.empty:
+        return norm
+
+    raw_idx = pd.to_datetime(raw.index)
+    raw_local = raw_idx.tz_localize(None).normalize() if getattr(raw_idx, "tz", None) is not None else raw_idx.normalize()
+    raw_max_date = pd.Timestamp(raw_local.max())
+    norm_max_date = pd.Timestamp(norm.index.max())
+    if raw_max_date <= norm_max_date:
+        return norm
+
+    try:
+        h1 = tk.history(period="5d", interval="1h", auto_adjust=True, actions=False)
+    except Exception:
+        return norm
+    if h1 is None or h1.empty:
+        return norm
+
+    h1_norm = _normalize_ohlcv_df(h1, interval="1h")
+    if h1_norm.empty:
+        return norm
+
+    # Use exchange calendar date from original intraday index before normalization
+    h1_raw_idx = pd.to_datetime(h1.index)
+    h1_dates = (
+        h1_raw_idx.tz_localize(None).normalize()
+        if getattr(h1_raw_idx, "tz", None) is not None
+        else h1_raw_idx.normalize()
+    )
+    h1_work = h1.copy()
+    if isinstance(h1_work.columns, pd.MultiIndex):
+        h1_work.columns = [str(col[0]) for col in h1_work.columns]
+    h1_work.columns = [str(c).strip().title() for c in h1_work.columns]
+    h1_work["_day"] = h1_dates
+    missing_day_df = h1_work[h1_work["_day"] > norm_max_date].dropna(subset=["Close"])
+    if missing_day_df.empty:
+        return norm
+
+    fast_last: Optional[float] = None
+    try:
+        lp = getattr(tk.fast_info, "last_price", None)
+        if lp is not None and math.isfinite(float(lp)) and float(lp) > 0.0:
+            fast_last = float(lp)
+    except Exception:
+        fast_last = None
+
+    new_rows = []
+    max_missing_day = missing_day_df["_day"].max()
+    for day_ts, grp in missing_day_df.groupby("_day", sort=True):
+        close_val = float(grp["Close"].iloc[-1])
+        if fast_last is not None and day_ts == max_missing_day and day_ts == raw_max_date:
+            close_val = fast_last
+        hi_val = max(float(grp["High"].max()), close_val)
+        lo_val = min(float(grp["Low"].min()), close_val)
+        vol_val = float(pd.to_numeric(grp.get("Volume", 0.0), errors="coerce").fillna(0.0).sum())
+        new_rows.append(
+            {
+                "Timestamp": day_ts,
+                "Open": float(grp["Open"].iloc[0]),
+                "High": hi_val,
+                "Low": lo_val,
+                "Close": close_val,
+                "Volume": vol_val,
+            }
+        )
+
+    if not new_rows:
+        return norm
+    add_df = pd.DataFrame(new_rows).set_index("Timestamp")
+    merged = pd.concat([norm, add_df], axis=0)
+    merged = merged[~merged.index.duplicated(keep="last")].sort_index()
+    merged.index.name = "Timestamp"
+    return merged
+
+
 def fetch_ohlcv(
     ticker: str,
     period: str = "10y",
@@ -107,6 +188,8 @@ def fetch_ohlcv(
             tk = yf.Ticker(ticker)
             raw = tk.history(period=period, interval=interval, auto_adjust=True, actions=False)
             norm = _normalize_ohlcv_df(raw, interval=interval)
+            if interval == "1d" and not norm.empty:
+                norm = _repair_trailing_daily_nan(tk, raw, norm)
             if not norm.empty:
                 norm.to_parquet(cpath)
                 return norm

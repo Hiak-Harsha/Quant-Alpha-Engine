@@ -771,5 +771,52 @@ def test_fastapi_endpoints_and_paper_flow() -> None:
     assert "n_matured" in r_corr.json()
 
 
+def test_daily_nan_backfill_from_intraday_and_fast_info() -> None:
+    from quant_alpha.data.market_feed import _normalize_ohlcv_df, _repair_trailing_daily_nan
+
+    ist_daily = pd.DatetimeIndex(["2026-11-25 00:00:00", "2026-11-26 00:00:00"]).tz_localize("Asia/Kolkata")
+    raw_daily = pd.DataFrame(
+        {
+            "Open": [140.0, float("nan")],
+            "High": [142.0, float("nan")],
+            "Low": [138.0, float("nan")],
+            "Close": [138.40, float("nan")],
+            "Volume": [100000.0, 0.0],
+        },
+        index=ist_daily,
+    )
+    norm = _normalize_ohlcv_df(raw_daily, interval="1d")
+    assert len(norm) == 1
+
+    ist_h1 = pd.DatetimeIndex(["2026-11-26 09:15:00", "2026-11-26 15:15:00"]).tz_localize("Asia/Kolkata")
+    h1_df = pd.DataFrame(
+        {
+            "Open": [139.5, 141.6],
+            "High": [141.0, 142.0],
+            "Low": [139.0, 141.0],
+            "Close": [140.8, 141.27],
+            "Volume": [50000.0, 60000.0],
+        },
+        index=ist_h1,
+    )
+
+    class _FakeTicker:
+        class _FastInfo:
+            last_price = 141.48
+
+        fast_info = _FastInfo()
+
+        def history(self, **_kwargs: object) -> pd.DataFrame:
+            return h1_df
+
+    repaired = _repair_trailing_daily_nan(_FakeTicker(), raw_daily, norm)
+    assert len(repaired) == 2
+    assert repaired.index[-1].strftime("%Y-%m-%d") == "2026-11-26"
+    assert np.isclose(float(repaired["Close"].iloc[-1]), 141.48)
+    assert np.isclose(float(repaired["Open"].iloc[-1]), 139.5)
+    assert np.isclose(float(repaired["Volume"].iloc[-1]), 110000.0)
+
+
+
 
 
